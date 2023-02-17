@@ -23,7 +23,7 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 var (
-	sleepTime          = 1 * time.Second
+	sleepTime          = 12 * time.Second
 	lockExpirationTime = 10 * time.Second
 	machineID          = 0
 )
