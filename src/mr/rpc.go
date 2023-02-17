@@ -14,6 +14,14 @@ import "strconv"
 // and reply for an RPC.
 //
 
+type TaskType int
+
+const (
+	MapTask TaskType = iota
+	ReduceTask
+	NoTask
+)
+
 type ExampleArgs struct {
 	X int
 }
@@ -24,6 +32,45 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+// func GetTask
+type GetTaskArgs struct {
+	MachineID int
+}
+
+type GetTaskReply struct {
+	MachineID  int
+	TaskType   TaskType
+	TaskNumber int
+	Filename   []string
+	NReduce    int
+}
+
+// func TaskFail
+type TaskFailArgs struct {
+	TaskNumber int
+	MachineID  int
+}
+
+type TaskFailReply struct {
+}
+
+// func Recovery
+type RecoveryArgs struct {
+	MachineID int
+}
+
+type RecoveryReply struct {
+}
+
+// func TaskSuccess
+type TaskSuccessArgs struct {
+	MachineID  int
+	TaskNumber int
+	TaskType   TaskType
+}
+
+type TaskSuccessReply struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
