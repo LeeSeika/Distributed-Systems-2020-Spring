@@ -181,6 +181,8 @@ func (c *Coordinator) TaskFail(args *TaskFailArgs, reply *TaskFailReply) error {
 	c.workerStatusMap[args.MachineID] = idle
 	c.workerStatusLock.Unlock()
 
+	log.Printf("fail task type:%v", c.currentTaskType)
+
 	return nil
 }
 
@@ -242,7 +244,6 @@ func (c *Coordinator) TaskSuccess(args *TaskSuccessArgs, reply *TaskSuccessReply
 		defer c.taskLock.Unlock()
 		c.reduceTaskStatus[args.TaskNumber] = done
 
-		log.Printf("reduce task %d done", args.TaskNumber)
 		// 判断map任务是否全部完成
 		isAllDone := true
 		for _, value := range c.reduceTaskStatus {
@@ -252,7 +253,9 @@ func (c *Coordinator) TaskSuccess(args *TaskSuccessArgs, reply *TaskSuccessReply
 			}
 		}
 		if isAllDone {
-			// todo 将所有output文件整合成一个，并排序
+			// 删除生成的中间文件和锁文件
+			os.RemoveAll("./intermediate/")
+			os.RemoveAll("./lock_files/")
 			c.doneCh <- 1
 		}
 	}

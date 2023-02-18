@@ -23,7 +23,7 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 var (
-	sleepTime          = 12 * time.Second
+	sleepTime          = 2 * time.Second
 	lockExpirationTime = 10 * time.Second
 	machineID          = 0
 )
@@ -76,46 +76,62 @@ func Worker(mapf func(string, string) []KeyValue,
 		call(RPCFunctionGetTask, &args, &reply)
 
 		machineID = reply.MachineID
-
 		if reply.TaskType != NoTask {
 
 			// 加锁
-			lockFilePath := fmt.Sprintf("./lockfile_%d", reply.TaskNumber)
+			_ = os.Mkdir("lock_files", os.ModePerm)
+			lockFilePath := fmt.Sprintf("./lock_files/lockfile_%d", reply.TaskNumber)
 			lockFile, err := os.OpenFile(lockFilePath, os.O_RDWR|os.O_CREATE, 0666)
 			if err != nil {
 				// todo send rpc fail message
+				lockFile.Close()
 				sendFailTaskRPC(reply.TaskNumber)
-				return
+				// 回到最外层循环
+				continue
 			}
+
 			err = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 			if err != nil {
 				// todo send rpc fail message
+				lockFile.Close()
 				sendFailTaskRPC(reply.TaskNumber)
-				return
+				// 回到最外层循环
+				continue
 			}
+
+			// 设置持有锁的过期时间
 			go func() {
 				time.Sleep(lockExpirationTime)
 				syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 				lockFile.Close()
 			}()
+
 			_, err = lockFile.WriteString(fmt.Sprintf("%d", reply.MachineID))
 			if err != nil {
 				// todo send rpc fail message
+				lockFile.Close()
 				sendFailTaskRPC(reply.TaskNumber)
-				return
+				// 回到最外层循环
+				continue
 			}
 
+			log.Printf("task type:%v", reply.TaskType)
 			if reply.TaskType == MapTask {
 				// 读取文件并进行map
 				filename := reply.Filename[0]
 				intermediate := []KeyValue{}
-				file, err := os.Open("./main/" + filename)
+				//file, err := os.Open("./main/" + filename)
+				file, err := os.Open(filename)
 				if err != nil {
-					log.Fatalf("cannot open %v %s", filename, err.Error())
+					log.Printf("cannot open %v %s", filename, err.Error())
+					// 回到最外层循环
+					continue
 				}
 				content, err := ioutil.ReadAll(file)
 				if err != nil {
-					log.Fatalf("cannot read %v", filename)
+					log.Printf("cannot read %v", filename)
+					// 回到最外层循环
+					continue
 				}
 				file.Close()
 				kva := mapf(filename, string(content))
@@ -123,23 +139,30 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				// 将中间结果输出到磁盘
 				intermediateFileMap := map[string]string{}
+				success := true
 				for _, ele := range intermediate {
 					fileBytes, err2 := ioutil.ReadFile(lockFilePath)
 					if err2 != nil {
 						// todo send rpc fail message
 						sendFailTaskRPC(reply.TaskNumber)
-						return
+						// 回到最外层循环
+						success = false
+						break
 					}
 					machineIDFromLockFile, err2 := strconv.Atoi(string(fileBytes))
 					if err2 != nil {
 						// todo send rpc fail message
 						sendFailTaskRPC(reply.TaskNumber)
-						return
+						// 回到最外层循环
+						success = false
+						break
 					}
 					if machineIDFromLockFile != machineID {
 						// todo send rpc recovery message
 						sendRecoveryRPC(reply.TaskNumber)
-						return
+						// 回到最外层循环
+						success = false
+						break
 					}
 					reduceTaskNumber := ihash(ele.Key) % reply.NReduce
 					intermediateFilename := fmt.Sprintf("mr-%d-%d", reply.TaskNumber, reduceTaskNumber)
@@ -151,7 +174,9 @@ func Worker(mapf func(string, string) []KeyValue,
 							if err2 != nil {
 								// todo send rpc fail message
 								sendFailTaskRPC(reply.TaskNumber)
-								return
+								// 回到最外层循环
+								success = false
+								break
 							}
 						}
 						intermediateFileMap[intermediateFilename] = "exist"
@@ -168,9 +193,16 @@ func Worker(mapf func(string, string) []KeyValue,
 					err2 = encoder.Encode(&ele)
 					if err2 != nil {
 						// todo send rpc fail message
+						intermediateFile.Close()
 						sendFailTaskRPC(reply.TaskNumber)
 						return
 					}
+					// 释放资源
+					intermediateFile.Close()
+				}
+				if !success {
+					// 回到最外层循环
+					continue
 				}
 				// 完成 map任务
 				successArgs := TaskSuccessArgs{
@@ -188,16 +220,20 @@ func Worker(mapf func(string, string) []KeyValue,
 				if err2 != nil {
 					// todo send rpc fail message
 					sendFailTaskRPC(reply.TaskNumber)
-					return
+					// 回到最外层循环
+					continue
 				}
+
 				// 如果有上一个worker未完成的数据，需要先删除
 				_, err2 = os.Stat(outputFilename)
 				if os.IsExist(err2) {
 					err2 = os.Remove(outputFilename)
 					if err2 != nil {
 						// todo send rpc fail message
+						outputFile.Close()
 						sendFailTaskRPC(reply.TaskNumber)
-						return
+						// 回到最外层循环
+						continue
 					}
 				}
 				// 读取intermediate文件
@@ -207,8 +243,10 @@ func Worker(mapf func(string, string) []KeyValue,
 					// 读入中间结果
 					file, err2 := os.OpenFile("./intermediate/"+filename, os.O_RDONLY, 0644)
 					if err2 != nil {
+						file.Close()
 						sendFailTaskRPC(reply.TaskNumber)
-						return
+						// 回到最外层循环
+						continue
 					}
 					decoder := json.NewDecoder(file)
 					for {
@@ -218,9 +256,9 @@ func Worker(mapf func(string, string) []KeyValue,
 						}
 						intermediate = append(intermediate, kv)
 					}
+					file.Close()
 				}
 				// 排序intermediate
-				log.Printf("reduce task %d", reply.TaskNumber)
 				sort.Sort(ByKey(intermediate))
 				//读完所有的intermediate，开始reduce
 				i := 0
@@ -244,7 +282,12 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 				successReply := TaskSuccessReply{}
 				call(RPCFunctionTaskSuccess, &successArgs, &successReply)
+				// 释放资源
+				outputFile.Close()
 			}
+			// 解锁
+			syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+			lockFile.Close()
 		}
 
 		time.Sleep(sleepTime)
