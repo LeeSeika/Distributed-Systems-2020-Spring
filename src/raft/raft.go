@@ -277,29 +277,29 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, replyCh chan int, stopSignal *int, wg *sync.WaitGroup, signalLock *sync.Mutex) bool {
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, replyCh chan int, stopSignal *int, wg *sync.WaitGroup) bool {
 	ok := false
-	haha := false
+	hasSent := false
 	for ok != true {
 		// 有些节点暂时crash了，但是不影响raft集群工作，raft如果发现大部分节点应该接收了上一条日志，就会进行下一条日志的同步
 		// 这就对应replyCh被关闭的情况，这时候就不对crash节点进行重复的sendAppend操作了，节省资源
-		signalLock.Lock()
+		rf.mu.Lock()
 		if *stopSignal == 1 {
-			signalLock.Unlock()
+			rf.mu.Unlock()
 			return ok
 		} else {
-			signalLock.Unlock()
-			if !haha {
+			rf.mu.Unlock()
+			if !hasSent {
 				log.Printf("rf:%v term:%v send heartbeat to %v", rf.me, rf.term, server)
-				haha = true
+				wg.Done()
+				hasSent = true
 			}
-			wg.Done()
 			ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 		}
 	}
 
-	signalLock.Lock()
-	defer signalLock.Unlock()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if *stopSignal != 1 {
 		replyCh <- 1
 	}
@@ -455,8 +455,7 @@ func (rf *Raft) sendHeartbeat() {
 	// wait group 防止一种特殊的情况，leader至少尝试一次对每一个follower发出RPC，才会走下面的逻辑，否则可能一轮RPC都还没发完
 	// 就已经接收到超过一半的append成功回复了，就会造成集群中一些节点一次都没有接收到append RPC
 	wg := sync.WaitGroup{}
-	// 搞一个临时的锁去控制"send append rpc"各个goroutine对stopSignal的争抢，不应该用rf.mu，因为争抢的不是rf结构体的共享资源
-	signalLock := sync.Mutex{}
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -466,7 +465,7 @@ func (rf *Raft) sendHeartbeat() {
 			LeaderTerm: rf.term,
 		}
 		reply := AppendEntriesReply{}
-		go rf.sendAppendEntries(i, &args, &reply, replyCh, &stopSignal, &wg, &signalLock)
+		go rf.sendAppendEntries(i, &args, &reply, replyCh, &stopSignal, &wg)
 	}
 
 	rf.mu.Unlock()
