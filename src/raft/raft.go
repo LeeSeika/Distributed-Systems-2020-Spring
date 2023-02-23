@@ -78,6 +78,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	command interface{}
+	index   int
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -94,6 +99,8 @@ type Raft struct {
 	meIdentity                    machineIdentity
 	term                          int
 	appendCh                      chan int
+	lastLogIndex                  int
+	logCh                         chan *LogEntry
 }
 
 // return currentTerm and whether this server
@@ -167,6 +174,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	ElectionTerm int
+	LastLogIndex int
 }
 
 // example RequestVote RPC reply structure.
@@ -179,6 +187,8 @@ type RequestVoteReply struct {
 
 type AppendEntriesArgs struct {
 	LeaderTerm int
+	LogIndex   int
+	Command    interface{}
 }
 
 type AppendEntriesReply struct {
@@ -198,7 +208,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// todo 论文5.4.1 检查日志完整性，candidate完整性低的话投反对票
+	// 论文5.4.1 检查日志完整性，candidate完整性低的话投反对票
+	if rf.lastLogIndex > args.LastLogIndex {
+		log.Printf("rf:%v term:%v vote down", rf.me, rf.term)
+		reply.VoteUp = false
+		return
+	}
 
 	// 日志完整性校验通过，投赞成票
 	log.Printf("rf:%v term:%v vote up", rf.me, rf.term)
@@ -218,8 +233,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply = nil
 			return
 		}
+		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
+		// 但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
+		if rf.lastLogIndex >= args.LogIndex {
+			// reply置为nil，说明没有理会过期的append消息
+			reply = nil
+			return
+		}
 		// 通知正在发送voteRequest的goroutine停止
 		rf.appendCh <- 1
+		// 更新日志状态
+		rf.lastLogIndex = args.LogIndex
 		rf.term = args.LeaderTerm
 		rf.lastReceivedAppendEntriesDate = time.Now()
 	} else if rf.meIdentity == follower {
@@ -229,6 +253,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply = nil
 			return
 		}
+		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
+		// 但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
+		if rf.lastLogIndex >= args.LogIndex {
+			// reply置为nil，说明没有理会过期的append消息
+			reply = nil
+			return
+		}
+		// 更新日志状态
+		rf.lastLogIndex = args.LogIndex
 		rf.term = args.LeaderTerm
 		rf.lastReceivedAppendEntriesDate = time.Now()
 	} else if rf.meIdentity == leader {
@@ -237,6 +270,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply = nil
 			return
 		}
+		// 更新日志状态
+		rf.lastLogIndex = args.LogIndex
 		rf.term = args.LeaderTerm
 		rf.lastReceivedAppendEntriesDate = time.Now()
 		rf.meIdentity = follower
@@ -282,20 +317,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	hasSent := false
 	for ok != true {
 		// 有些节点暂时crash了，但是不影响raft集群工作，raft如果发现大部分节点应该接收了上一条日志，就会进行下一条日志的同步
-		// 这就对应replyCh被关闭的情况，这时候就不对crash节点进行重复的sendAppend操作了，节省资源
-		rf.mu.Lock()
-		if *stopSignal == 1 {
-			rf.mu.Unlock()
-			return ok
-		} else {
-			rf.mu.Unlock()
-			if !hasSent {
-				log.Printf("rf:%v term:%v send heartbeat to %v", rf.me, rf.term, server)
-				wg.Done()
-				hasSent = true
-			}
-			ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		// 不过raft会一直发送日志，这时候不会影响后面的日志和对客户端的响应
+		if !hasSent {
+			log.Printf("rf:%v term:%v send heartbeat to %v", rf.me, rf.term, server)
+			wg.Done()
+			hasSent = true
 		}
+		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	}
 
 	rf.mu.Lock()
@@ -324,6 +352,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	term, isLeader = rf.GetState()
+	if !isLeader {
+		return 0, 0, false
+	}
+
+	rf.mu.Lock()
+	rf.lastLogIndex++
+	index = rf.lastLogIndex
+	logEntry := LogEntry{
+		command: command,
+		index:   index,
+	}
+	rf.mu.Unlock()
+
+	rf.logCh <- &logEntry
 
 	return index, term, isLeader
 }
@@ -390,6 +433,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.meIdentity = follower
 	rf.appendCh = make(chan int, len(rf.peers))
+	rf.logCh = make(chan *LogEntry, len(rf.peers))
+	rf.lastLogIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -455,6 +500,18 @@ func (rf *Raft) sendHeartbeat() {
 	// wait group 防止一种特殊的情况，leader至少尝试一次对每一个follower发出RPC，才会走下面的逻辑，否则可能一轮RPC都还没发完
 	// 就已经接收到超过一半的append成功回复了，就会造成集群中一些节点一次都没有接收到append RPC
 	wg := sync.WaitGroup{}
+	// append rpc内容
+	var logIndex int
+	var command interface{}
+
+	select {
+	case logEntry := <-rf.logCh:
+		command = logEntry.command
+		logIndex = logEntry.index
+	default:
+		logIndex = -1
+		command = nil
+	}
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -463,6 +520,8 @@ func (rf *Raft) sendHeartbeat() {
 		wg.Add(1)
 		args := AppendEntriesArgs{
 			LeaderTerm: rf.term,
+			LogIndex:   logIndex,
+			Command:    command,
 		}
 		reply := AppendEntriesReply{}
 		go rf.sendAppendEntries(i, &args, &reply, replyCh, &stopSignal, &wg)
@@ -525,6 +584,7 @@ func (rf *Raft) startNewElection() {
 		}
 		args := RequestVoteArgs{
 			ElectionTerm: electionTerm,
+			LastLogIndex: rf.lastLogIndex,
 		}
 		reply := RequestVoteReply{}
 		// 投票RPC新开一个goroutine去处理，当那些goroutine接收到reply时，通知这个goroutine
