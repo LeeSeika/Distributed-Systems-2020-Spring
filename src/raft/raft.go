@@ -81,6 +81,7 @@ type ApplyMsg struct {
 type LogEntry struct {
 	command interface{}
 	index   int
+	replyCh chan int
 }
 
 // A Go object implementing a single Raft peer.
@@ -101,6 +102,7 @@ type Raft struct {
 	appendCh                      chan int
 	lastLogIndex                  int
 	logCh                         chan *LogEntry
+	applyCh                       chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -224,7 +226,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.Printf("rf:%v term:%v leaderTearm:%v status:%v receive append", rf.me, rf.term, args.LeaderTerm, rf.meIdentity)
+	//log.Printf("rf:%v term:%v leaderTearm:%v status:%v receive append", rf.me, rf.term, args.LeaderTerm, rf.meIdentity)
 	// 如果当前处于candidate状态
 	if rf.meIdentity == candidate {
 		// 检查任期
@@ -235,7 +237,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
 		// 但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
-		if rf.lastLogIndex >= args.LogIndex {
+		// 当args.logIndex == -1的时候是一条空心跳包，接受它
+		if args.LogIndex != -1 && rf.lastLogIndex >= args.LogIndex {
 			// reply置为nil，说明没有理会过期的append消息
 			reply = nil
 			return
@@ -243,7 +246,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 通知正在发送voteRequest的goroutine停止
 		rf.appendCh <- 1
 		// 更新日志状态
-		rf.lastLogIndex = args.LogIndex
+		if args.LogIndex != -1 {
+			rf.lastLogIndex = args.LogIndex
+		}
 		rf.term = args.LeaderTerm
 		rf.lastReceivedAppendEntriesDate = time.Now()
 	} else if rf.meIdentity == follower {
@@ -255,13 +260,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
 		// 但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
-		if rf.lastLogIndex >= args.LogIndex {
+		// 当args.logIndex == -1的时候是一条空心跳包，接受它
+		if args.LogIndex != -1 && rf.lastLogIndex >= args.LogIndex {
 			// reply置为nil，说明没有理会过期的append消息
 			reply = nil
 			return
 		}
 		// 更新日志状态
-		rf.lastLogIndex = args.LogIndex
+		// 更新日志状态
+		if args.LogIndex != -1 {
+			rf.lastLogIndex = args.LogIndex
+		}
 		rf.term = args.LeaderTerm
 		rf.lastReceivedAppendEntriesDate = time.Now()
 	} else if rf.meIdentity == leader {
@@ -271,10 +280,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 		// 更新日志状态
-		rf.lastLogIndex = args.LogIndex
-		rf.term = args.LeaderTerm
-		rf.lastReceivedAppendEntriesDate = time.Now()
-		rf.meIdentity = follower
+		//rf.lastLogIndex = args.LogIndex
+		//rf.term = args.LeaderTerm
+		//rf.lastReceivedAppendEntriesDate = time.Now()
+		//rf.meIdentity = follower
+		log.Fatalf("mutiple leaders exist")
+	}
+	if args.LogIndex != -1 {
+		log.Printf("ready to send applych %v", rf.me)
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      args.Command,
+			CommandIndex: args.LogIndex,
+		}
+		rf.applyCh <- applyMsg
 	}
 }
 
@@ -319,7 +338,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		// 有些节点暂时crash了，但是不影响raft集群工作，raft如果发现大部分节点应该接收了上一条日志，就会进行下一条日志的同步
 		// 不过raft会一直发送日志，这时候不会影响后面的日志和对客户端的响应
 		if !hasSent {
-			log.Printf("rf:%v term:%v send heartbeat to %v", rf.me, rf.term, server)
+			//log.Printf("rf:%v term:%v send heartbeat to %v", rf.me, rf.term, server)
 			wg.Done()
 			hasSent = true
 		}
@@ -331,6 +350,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if *stopSignal != 1 {
 		replyCh <- 1
 	}
+
 	return ok
 }
 
@@ -358,15 +378,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.mu.Lock()
-	rf.lastLogIndex++
-	index = rf.lastLogIndex
+	index = rf.lastLogIndex + 1
 	logEntry := LogEntry{
 		command: command,
 		index:   index,
+		replyCh: make(chan int, 1),
 	}
 	rf.mu.Unlock()
 
 	rf.logCh <- &logEntry
+
+	select {
+	case <-logEntry.replyCh:
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      command,
+			CommandIndex: index,
+		}
+		rf.applyCh <- applyMsg
+		log.Println("receive reply client")
+	}
 
 	return index, term, isLeader
 }
@@ -435,6 +466,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.appendCh = make(chan int, len(rf.peers))
 	rf.logCh = make(chan *LogEntry, len(rf.peers))
 	rf.lastLogIndex = 0
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -461,7 +493,6 @@ func (rf *Raft) checkAppendEntries() {
 		// 超时未收到心跳，开始新的选举
 		// 判断是不是已经处于选举阶段了，如果是因为选举新leader引起的超时，则再睡一段时间
 		if rf.term != prevTerm {
-			log.Printf("1")
 			ctx, cancel := context.WithTimeout(context.Background(), minNewLeaderElectionTimeout+newLeaderElectionTimeoutInterval*time.Millisecond)
 			defer cancel()
 			// 记住！不能带锁睡觉，不然receive append那里无法拿到锁去唤醒这里的select
@@ -476,12 +507,12 @@ func (rf *Raft) checkAppendEntries() {
 			case <-ctx.Done():
 				// 超时还没有新leader的消息，则再开一轮选举
 				rf.mu.Lock()
-				log.Printf("rf:%v term:%v 选举中", rf.me, rf.term)
+				log.Printf("rf:%v term:%v 选举中超时", rf.me, rf.term)
 				rf.meIdentity = candidate
 				rf.mu.Unlock()
 			}
 		} else {
-			log.Printf("rf:%v term:%v", rf.me, rf.term)
+			log.Printf("rf:%v term:%v 普通超时", rf.me, rf.term)
 			rf.meIdentity = candidate
 			rf.mu.Unlock()
 		}
@@ -496,18 +527,20 @@ func (rf *Raft) sendHeartbeat() {
 	replyCh := make(chan int, len(rf.peers))
 	// stopSignal解决"多个sender一个receiver"同步关闭replyCh的问题
 	stopSignal := 0
-	log.Printf("rf:%v term:%v send heartbeat", rf.me, rf.term)
+	//log.Printf("rf:%v term:%v send heartbeat", rf.me, rf.term)
 	// wait group 防止一种特殊的情况，leader至少尝试一次对每一个follower发出RPC，才会走下面的逻辑，否则可能一轮RPC都还没发完
 	// 就已经接收到超过一半的append成功回复了，就会造成集群中一些节点一次都没有接收到append RPC
 	wg := sync.WaitGroup{}
 	// append rpc内容
 	var logIndex int
 	var command interface{}
+	var replyClientCh chan int
 
 	select {
 	case logEntry := <-rf.logCh:
 		command = logEntry.command
 		logIndex = logEntry.index
+		replyClientCh = logEntry.replyCh
 	default:
 		logIndex = -1
 		command = nil
@@ -546,6 +579,11 @@ CollectLogReply:
 				// todo answer 暂时不增加超时处理，因为如果没有一半以上的节点正常工作的话，Raft集群是处于不可用状态，这里就代表这种状态
 				rf.mu.Lock()
 				stopSignal = 1
+				// 如果本次发送的不是空的心跳包，则需要commit这条LogEntry
+				if logIndex != -1 {
+					rf.lastLogIndex++
+					replyClientCh <- 1
+				}
 				close(replyCh)
 				rf.mu.Unlock()
 				break CollectLogReply
