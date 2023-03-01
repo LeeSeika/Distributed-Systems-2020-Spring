@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"container/list"
 	"context"
 	"log"
 	"math/rand"
@@ -79,9 +80,9 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	command interface{}
-	index   int
-	replyCh chan int
+	command  interface{}
+	index    int
+	commitCh chan int
 }
 
 // A Go object implementing a single Raft peer.
@@ -103,6 +104,7 @@ type Raft struct {
 	lastLogIndex                  int
 	logCh                         chan *LogEntry
 	applyCh                       chan ApplyMsg
+	sendQueue                     []*list.List
 }
 
 // return currentTerm and whether this server
@@ -188,12 +190,18 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	LeaderTerm int
-	LogIndex   int
-	Command    interface{}
+	Leader            int
+	LeaderTerm        int
+	LogIndex          int
+	Command           interface{}
+	ReplyCh           chan int
+	ReplyChStopSignal *bool
+	NeedWaitApply     bool
 }
 
 type AppendEntriesReply struct {
+	Accept         bool
+	ExpectLogIndex int
 }
 
 // example RequestVote RPC handler.
@@ -226,57 +234,102 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//log.Printf("rf:%v term:%v leaderTearm:%v status:%v receive append", rf.me, rf.term, args.LeaderTerm, rf.meIdentity)
+
+	if args.LogIndex != -1 {
+		log.Printf("rf:%v follower receive idx:%v status:%v, lsatIdx:%v", rf.me, args.LogIndex, rf.meIdentity, rf.lastLogIndex)
+	}
+
 	// 如果当前处于candidate状态
 	if rf.meIdentity == candidate {
 		// 检查任期
 		if args.LeaderTerm < rf.term {
-			// reply置为nil，说明没有理会过期的append消息
-			reply = nil
-			return
+			// 考虑一种情况，某个follower自己网络出了问题，他开启了一次新的选举，但是因为是网络问题所以选票没有传出去
+			// 他也收不到其他节点的发对票，所以他一直重启选举
+			// 当他恢复网络时，收到了很多来自leader的append消息，如果收到了比自己lastLogIndex+1还要大的append消息，那说明
+			// 在他开启选举期间，整个集群都认为leader是有效的（因为lastLogIndex+1被leader commit了，才会发下一个append）
+			// 这样这个follower就能发现之前是自己出了问题
+			if args.LogIndex == -1 || args.LogIndex <= rf.lastLogIndex+1 {
+				// 即使args.LogIndex == rf.lastLogIndex+1，也有可能是leader真的超时了，我们依然认为自己的candidate是有效的
+				log.Printf("true from 1")
+				reply.Accept = false
+				reply.ExpectLogIndex = rf.lastLogIndex + 2
+				return
+			} else {
+				// 走到了这里，说明是自己出了问题开启了一次错误的选举，leader本身没有问题，需要恢复到原来的状态
+				// 恢复任期
+				log.Printf("rf:%v fount myself error", rf.me)
+				rf.term = args.LeaderTerm
+				rf.meIdentity = follower
+				// 通知正在发送voteRequest的goroutine停止
+				log.Printf("rf:%v 生产appendCh candidate", rf.me)
+				rf.appendCh <- 1
+				rf.lastReceivedAppendEntriesDate = time.Now()
+				// 走到这里虽然发现是自己的网络问题了，但是依然要无视，因为这条append RPC的logIndex > rf.lastLogIndex+1
+				// 是不连续的日志，我们期望的是rf.lastLogIndex+1的日志，所以我们现在还不能接受
+				// 我们把任期和identity恢复后，下一次收到leader重试的rf.lastLogIndex+1后就能恢复正常了
+				log.Printf("true from 2")
+				reply.Accept = false
+				reply.ExpectLogIndex = rf.lastLogIndex + 1
+				return
+			}
 		}
-		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
-		// 但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
-		// 当args.logIndex == -1的时候是一条空心跳包，接受它
-		if args.LogIndex != -1 && rf.lastLogIndex >= args.LogIndex {
-			// reply置为nil，说明没有理会过期的append消息
-			reply = nil
-			return
-		}
+		// 走到了这里，说明原来的leader出了问题，但是这轮选举中已经有了结果，有别的节点成功当上了leader
+		// 更新任期
+		rf.term = args.LeaderTerm
 		// 通知正在发送voteRequest的goroutine停止
-		rf.appendCh <- 1
+		rf.lastReceivedAppendEntriesDate = time.Now()
 		// 更新日志状态
 		if args.LogIndex != -1 {
 			rf.lastLogIndex = args.LogIndex
 		}
-		rf.term = args.LeaderTerm
-		rf.lastReceivedAppendEntriesDate = time.Now()
+		reply.Accept = true
+		reply.ExpectLogIndex = rf.lastLogIndex + 1
+
+		log.Printf("rf:%v 生产appendCh candidate", rf.me)
+		rf.appendCh <- 1
 	} else if rf.meIdentity == follower {
 		// 检查任期（针对可能两个leader同时存在的情况，旧leader发的append不理会）
 		if args.LeaderTerm < rf.term {
-			// reply置为nil，说明没有理会过期的append消息
-			reply = nil
+			// 没有理会过期leader的append消息
+			log.Printf("true from 3")
+			reply.Accept = false
+			reply.ExpectLogIndex = -1
 			return
 		}
 		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
 		// 但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
 		// 当args.logIndex == -1的时候是一条空心跳包，接受它
 		if args.LogIndex != -1 && rf.lastLogIndex >= args.LogIndex {
-			// reply置为nil，说明没有理会过期的append消息
-			reply = nil
+			reply.Accept = true
+			reply.ExpectLogIndex = rf.lastLogIndex + 1
+			rf.lastReceivedAppendEntriesDate = time.Now()
 			return
 		}
-		// 更新日志状态
+		// 日志错序，先不接受，等待rf.lastLogIndex + 1日志到达
+		if args.LogIndex != -1 && args.LogIndex != rf.lastLogIndex+1 {
+			rf.lastReceivedAppendEntriesDate = time.Now()
+			log.Printf("log index:%v, true from 4", args.LogIndex)
+			reply.Accept = false
+			reply.ExpectLogIndex = rf.lastLogIndex + 1
+			return
+		}
+
 		// 更新日志状态
 		if args.LogIndex != -1 {
 			rf.lastLogIndex = args.LogIndex
 		}
 		rf.term = args.LeaderTerm
 		rf.lastReceivedAppendEntriesDate = time.Now()
+		reply.Accept = true
+		reply.ExpectLogIndex = rf.lastLogIndex + 1
+
+		log.Printf("rf:%v 生产appendCh follower", rf.me)
+		rf.appendCh <- 1
 	} else if rf.meIdentity == leader {
 		if args.LeaderTerm < rf.term {
 			// reply置为nil，说明没有理会过期的append消息
-			reply = nil
+			reply.Accept = false
+			reply.ExpectLogIndex = -1
 			return
 		}
 		// 更新日志状态
@@ -331,23 +384,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, replyCh chan int, stopSignal *int, wg *sync.WaitGroup) bool {
-	ok := false
-	hasSent := false
-	for ok != true {
-		// 有些节点暂时crash了，但是不影响raft集群工作，raft如果发现大部分节点应该接收了上一条日志，就会进行下一条日志的同步
-		// 不过raft会一直发送日志，这时候不会影响后面的日志和对客户端的响应
-		if !hasSent {
-			//log.Printf("rf:%v term:%v send heartbeat to %v", rf.me, rf.term, server)
-			wg.Done()
-			hasSent = true
-		}
-		ok = rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	}
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	replyCh := args.ReplyCh
+	stopSignal := args.ReplyChStopSignal
+
+	log.Printf("ready send server:%v idx:%v", server, args.LogIndex)
+
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if *stopSignal != 1 {
+	if *stopSignal != true {
 		replyCh <- 1
 	}
 
@@ -380,16 +427,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	index = rf.lastLogIndex + 1
 	logEntry := LogEntry{
-		command: command,
-		index:   index,
-		replyCh: make(chan int, 1),
+		command:  command,
+		index:    index,
+		commitCh: make(chan int, 1),
 	}
 	rf.mu.Unlock()
 
 	rf.logCh <- &logEntry
 
 	select {
-	case <-logEntry.replyCh:
+	case <-logEntry.commitCh:
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      command,
@@ -463,10 +510,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.meIdentity = follower
-	rf.appendCh = make(chan int, len(rf.peers))
+	rf.appendCh = make(chan int, 1000*len(rf.peers))
 	rf.logCh = make(chan *LogEntry, len(rf.peers))
 	rf.lastLogIndex = 0
 	rf.applyCh = applyCh
+	rf.sendQueue = make([]*list.List, len(rf.peers))
+
+	//file := "./" + "log" + ".txt"
+	//logFile, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
+	//if err != nil {
+	//	panic(err)
+	//}
+	//log.SetOutput(logFile) // 将文件设置为log输出的文件
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -489,6 +544,7 @@ func (rf *Raft) checkAppendEntries() {
 	time.Sleep(realElectionTimeout)
 	// 与上一次记录的接收心跳时间作比较
 	rf.mu.Lock()
+	log.Printf("rf:%v follower check append", rf.me)
 	if time.Since(rf.lastReceivedAppendEntriesDate) > realElectionTimeout {
 		// 超时未收到心跳，开始新的选举
 		// 判断是不是已经处于选举阶段了，如果是因为选举新leader引起的超时，则再睡一段时间
@@ -501,8 +557,9 @@ func (rf *Raft) checkAppendEntries() {
 			case <-rf.appendCh:
 				// 新的leader已经发消息来了，解除睡眠
 				// 因为appendCh带缓冲区，所以要清空可能囤积的消息
-				for _ = range rf.appendCh {
-				}
+				//for _ = range rf.appendCh {
+				//}
+				log.Printf("rf:%v 消费appendCh 新任期超时唤醒", rf.me)
 				return
 			case <-ctx.Done():
 				// 超时还没有新leader的消息，则再开一轮选举
@@ -518,51 +575,64 @@ func (rf *Raft) checkAppendEntries() {
 		}
 	} else {
 		// 如果没有超时，这里直接解锁
+		// 消费来自follower状态下，正常接收一条append日志的appendCh
+		//for _ = range rf.appendCh {
+		//}
+		log.Printf("rf:%v lastIdx:%v 没有超时", rf.me, rf.lastLogIndex)
 		rf.mu.Unlock()
+		<-rf.appendCh
+		log.Printf("rf:%v 消费appendCh follower没有超时", rf.me)
+
 	}
 }
 
 func (rf *Raft) sendHeartbeat() {
-	// todo 加上日志逻辑后，如果每次interval后有日志就发送带日志信息的appendRPC，无日志就发送维持leader地位的心跳appendRPC
+	// 本轮日志发送的reply收集channel
 	replyCh := make(chan int, len(rf.peers))
 	// stopSignal解决"多个sender一个receiver"同步关闭replyCh的问题
-	stopSignal := 0
+	stopSignal := false
 	//log.Printf("rf:%v term:%v send heartbeat", rf.me, rf.term)
-	// wait group 防止一种特殊的情况，leader至少尝试一次对每一个follower发出RPC，才会走下面的逻辑，否则可能一轮RPC都还没发完
-	// 就已经接收到超过一半的append成功回复了，就会造成集群中一些节点一次都没有接收到append RPC
-	wg := sync.WaitGroup{}
+
 	// append rpc内容
 	var logIndex int
 	var command interface{}
 	var replyClientCh chan int
+	var needWaitApply bool
 
+	// 如果有新的命令，则发送命令包，否则发送空心跳包
 	select {
 	case logEntry := <-rf.logCh:
 		command = logEntry.command
 		logIndex = logEntry.index
-		replyClientCh = logEntry.replyCh
+		replyClientCh = logEntry.commitCh
 	default:
 		logIndex = -1
 		command = nil
 	}
+	needWaitApply = rf.lastLogIndex < logIndex
+
+	log.Printf("add to send queue log:%v", logIndex)
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		wg.Add(1)
-		args := AppendEntriesArgs{
-			LeaderTerm: rf.term,
-			LogIndex:   logIndex,
-			Command:    command,
+
+		args := &AppendEntriesArgs{
+			Leader:            rf.me,
+			LeaderTerm:        rf.term,
+			LogIndex:          logIndex,
+			Command:           command,
+			ReplyCh:           replyCh,
+			ReplyChStopSignal: &stopSignal,
+			NeedWaitApply:     needWaitApply,
 		}
-		reply := AppendEntriesReply{}
-		go rf.sendAppendEntries(i, &args, &reply, replyCh, &stopSignal, &wg)
+		// 添加到发送队列
+		rf.sendQueue[i].PushBack(args)
 	}
 
 	rf.mu.Unlock()
 
-	wg.Wait()
 	prevNow := time.Now()
 
 	currReplies := 0
@@ -578,7 +648,7 @@ CollectLogReply:
 				// todo 现在无限重试到一半节点成功接收的情况，是否要增加超时处理
 				// todo answer 暂时不增加超时处理，因为如果没有一半以上的节点正常工作的话，Raft集群是处于不可用状态，这里就代表这种状态
 				rf.mu.Lock()
-				stopSignal = 1
+				stopSignal = true
 				// 如果本次发送的不是空的心跳包，则需要commit这条LogEntry
 				if logIndex != -1 {
 					rf.lastLogIndex++
@@ -661,6 +731,7 @@ CollectVotes:
 			break CollectVotes
 		// 如果在此期间收到了新leader的RPC，说明从这里变回follower状态
 		case <-rf.appendCh:
+			log.Printf("rf:%v 消费appendCh", rf.me)
 			voteRes = voteFail
 			break CollectVotes
 		}
@@ -672,12 +743,91 @@ CollectVotes:
 	defer rf.mu.Unlock()
 	if voteRes == voteSuccess {
 		// 选举成功
+		log.Printf("rf:%v elect success", rf.me)
+		// 初始化发送列表
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			rf.sendQueue[i] = list.New()
+			// 启动发送队列
+			go rf.processSendQueue(i)
+		}
+
 		rf.meIdentity = leader
 	} else if voteRes == voteFail {
 		// 选举失败
+		log.Printf("选举失败")
 		rf.meIdentity = follower
 	} else if voteRes == voteTimeout {
 		// 超时，重新选举
 		rf.meIdentity = candidate
+	}
+}
+
+func (rf *Raft) processSendQueue(server int) {
+	for true {
+		// 每次循环都检查自己的leader身份是否结束
+		//rf.mu.Lock()
+		isLeader := rf.meIdentity == leader
+		//rf.mu.Unlock()
+		if !isLeader {
+			// 清空sendQueue
+			log.Printf("found not leader")
+			for node := rf.sendQueue[server].Front(); node != nil; node = node.Next() {
+				rf.sendQueue[server].Remove(node)
+			}
+			return
+		}
+		if rf.sendQueue[server].Len() > 0 {
+			front := rf.sendQueue[server].Front()
+			args := front.Value.(*AppendEntriesArgs)
+			reply := AppendEntriesReply{}
+
+			ok := rf.sendAppendEntries(server, args, &reply)
+			log.Printf("leader receive append reply server:%v ok:%v, accept:%v ,expect:%v", server, ok, reply.Accept, reply.ExpectLogIndex)
+			if !ok {
+
+			} else if reply.Accept == false {
+				if reply.ExpectLogIndex != -1 {
+					// 遍历这个server的queue，找到expect后放到头部第一个重发
+					found := false
+					for node := rf.sendQueue[server].Front(); node != nil; node = node.Next() {
+						if node.Value.(*AppendEntriesArgs).LogIndex == reply.ExpectLogIndex {
+							found = true
+							rf.sendQueue[server].MoveToFront(node)
+						}
+					}
+					if found != true {
+						log.Printf("not found idx:%v", reply.ExpectLogIndex)
+					}
+					// todo 如果queue里没有则从persister里面找
+				}
+			} else {
+				// 一切正常
+				rf.sendQueue[server].Remove(front)
+				// 查看是否需要调整队列优先级
+				rf.mu.Lock()
+				lastLogIndex := rf.lastLogIndex
+				rf.mu.Unlock()
+				if reply.ExpectLogIndex != -1 && reply.ExpectLogIndex <= lastLogIndex {
+					// 遍历这个server的queue，找到expect后放到头部第一个重发
+					found := false
+					for node := rf.sendQueue[server].Front(); node != nil; node = node.Next() {
+						if node.Value.(*AppendEntriesArgs).LogIndex == reply.ExpectLogIndex {
+							found = true
+							rf.sendQueue[server].MoveToFront(node)
+						}
+					}
+					if found != true {
+						log.Printf("not found idx:%v", reply.ExpectLogIndex)
+					}
+					// todo 如果queue里没有则从persister里面找
+				}
+			}
+		} else {
+			// 没有发送任务
+			time.Sleep(appendEntriesInterval / 5)
+		}
 	}
 }

@@ -190,6 +190,7 @@ func TestFailAgree2B(t *testing.T) {
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
 	cfg.disconnect((leader + 1) % servers)
+	log.Printf("discon:%v", (leader+1)%servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
@@ -263,6 +264,14 @@ func TestFailNoAgree2B(t *testing.T) {
 
 	cfg.end()
 }
+
+// todo appendArgs加上一个字段，needWaitCommit，如果要发的logIndex大于leader.lastLogIndex
+// todo 就needWaitCommit=true。master在收到半数以上的reply时，再发送一个commitRPC，这个RPC不会重发
+// todo follower要维护一个map，未commit的log要存在map里。follower commit后才更新自己的lastLogIndex
+// todo 如果没收到commitRPC就收到了更新的appendRPC，就走日志错序的逻辑（这时候master是通过map来retry的）
+
+// todo raft节点要维护leader编号，如果follower状态下收到的最后一条log的时间和旧leader发来的新log时间差
+// todo 大于选举超时时间，则回复follower状态
 
 func TestConcurrentStarts2B(t *testing.T) {
 	servers := 3
