@@ -204,6 +204,14 @@ type AppendEntriesReply struct {
 	ExpectLogIndex int
 }
 
+type CommitEntriesArgs struct {
+	LogIndex int
+	Command  interface{}
+}
+
+type CommitEntriesReply struct {
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -339,7 +347,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//rf.meIdentity = follower
 		log.Fatalf("mutiple leaders exist")
 	}
-	if args.LogIndex != -1 {
+	if args.NeedWaitApply != true && args.LogIndex != -1 {
 		log.Printf("ready to send applych %v", rf.me)
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -348,6 +356,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.applyCh <- applyMsg
 	}
+}
+
+func (rf *Raft) CommitEntries(args *CommitEntriesArgs, reply *CommitEntriesReply) {
+	// 收到了错序的commit消息，无视
+	if args.LogIndex > rf.lastLogIndex {
+		return
+	}
+	log.Printf("ready to send applych %v", rf.me)
+	applyMsg := ApplyMsg{
+		CommandValid: true,
+		Command:      args.Command,
+		CommandIndex: args.LogIndex,
+	}
+	rf.applyCh <- applyMsg
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -399,6 +421,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 
 	return ok
+}
+
+func (rf *Raft) sendCommitEntries(server int, args *CommitEntriesArgs, reply *CommitEntriesReply) {
+	rf.peers[server].Call("Raft.CommitEntries", args, reply)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -597,7 +623,6 @@ func (rf *Raft) sendHeartbeat() {
 	var logIndex int
 	var command interface{}
 	var replyClientCh chan int
-	var needWaitApply bool
 
 	// 如果有新的命令，则发送命令包，否则发送空心跳包
 	select {
@@ -609,7 +634,6 @@ func (rf *Raft) sendHeartbeat() {
 		logIndex = -1
 		command = nil
 	}
-	needWaitApply = rf.lastLogIndex < logIndex
 
 	log.Printf("add to send queue log:%v", logIndex)
 
@@ -625,7 +649,6 @@ func (rf *Raft) sendHeartbeat() {
 			Command:           command,
 			ReplyCh:           replyCh,
 			ReplyChStopSignal: &stopSignal,
-			NeedWaitApply:     needWaitApply,
 		}
 		// 添加到发送队列
 		rf.sendQueue[i].PushBack(args)
@@ -653,6 +676,7 @@ CollectLogReply:
 				if logIndex != -1 {
 					rf.lastLogIndex++
 					replyClientCh <- 1
+					rf.sendCommitRPC(logIndex, command)
 				}
 				close(replyCh)
 				rf.mu.Unlock()
@@ -765,6 +789,20 @@ CollectVotes:
 	}
 }
 
+func (rf *Raft) sendCommitRPC(logIndex int, command interface{}) {
+	for server := 0; server < len(rf.peers); server++ {
+		if server == rf.me {
+			continue
+		}
+		args := CommitEntriesArgs{
+			LogIndex: logIndex,
+			Command:  command,
+		}
+		reply := CommitEntriesReply{}
+		go rf.sendCommitEntries(server, &args, &reply)
+	}
+}
+
 func (rf *Raft) processSendQueue(server int) {
 	for true {
 		// 每次循环都检查自己的leader身份是否结束
@@ -783,7 +821,13 @@ func (rf *Raft) processSendQueue(server int) {
 			front := rf.sendQueue[server].Front()
 			args := front.Value.(*AppendEntriesArgs)
 			reply := AppendEntriesReply{}
-
+			rf.mu.Lock()
+			if args.LogIndex > rf.lastLogIndex {
+				args.NeedWaitApply = true
+			} else {
+				args.NeedWaitApply = false
+			}
+			rf.mu.Unlock()
 			ok := rf.sendAppendEntries(server, args, &reply)
 			log.Printf("leader receive append reply server:%v ok:%v, accept:%v ,expect:%v", server, ok, reply.Accept, reply.ExpectLogIndex)
 			if !ok {
