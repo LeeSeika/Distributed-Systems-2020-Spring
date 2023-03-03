@@ -265,14 +265,6 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.end()
 }
 
-// todo appendArgs加上一个字段，needWaitCommit，如果要发的logIndex大于leader.lastLogIndex
-// todo 就needWaitCommit=true。master在收到半数以上的reply时，再发送一个commitRPC，这个RPC不会重发
-// todo follower要维护一个map，未commit的log要存在map里。follower commit后才更新自己的lastLogIndex
-// todo 如果没收到commitRPC就收到了更新的appendRPC，就走日志错序的逻辑（这时候master是通过map来retry的）
-
-// todo raft节点要维护leader编号，如果follower状态下收到的最后一条log的时间和旧leader发来的新log时间差
-// todo 大于选举超时时间，则回复follower状态
-
 func TestConcurrentStarts2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -289,9 +281,11 @@ loop:
 		}
 
 		leader := cfg.checkOneLeader()
+		log.Printf("来自test： 发送命令 cmd:1")
 		_, term, ok := cfg.rafts[leader].Start(1)
 		if !ok {
 			// leader moved on really quickly
+			log.Printf("来自test： 处于无leader状态")
 			continue
 		}
 
@@ -302,11 +296,14 @@ loop:
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
+				log.Printf("来自test： 发送命令 cmd:%v", 100+i)
 				i, term1, ok := cfg.rafts[leader].Start(100 + i)
 				if term1 != term {
+					log.Printf("来自test： term不同 cmd:%v term:%v, term1:%v", 100+i, term, term1)
 					return
 				}
 				if ok != true {
+					log.Printf("来自test： leader变了 cmd:%v", 100+i)
 					return
 				}
 				is <- i
@@ -319,6 +316,7 @@ loop:
 		for j := 0; j < servers; j++ {
 			if t, _ := cfg.rafts[j].GetState(); t != term {
 				// term changed -- can't expect low RPC counts
+				log.Printf("来自test： term changed t:%v term:%v", t, term)
 				continue loop
 			}
 		}
@@ -342,6 +340,7 @@ loop:
 		}
 
 		if failed {
+			log.Printf("来自test： 失败了")
 			// avoid leaking goroutines
 			go func() {
 				for range is {
