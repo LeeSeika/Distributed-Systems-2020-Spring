@@ -100,6 +100,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	lastReceivedAppendEntriesDate time.Time
+	lastReceiveFollowerDate       time.Time //用于leader判断自己是否脱离集群，失去leader地位了
 	meIdentity                    machineIdentity
 	term                          int
 	appendCh                      chan int
@@ -110,6 +111,7 @@ type Raft struct {
 	sendQueue                     []*list.List
 	leader                        int
 	notCommitCmdMap               map[int]interface{}
+	logPersister                  map[int]interface{}
 }
 
 // return currentTerm and whether this server
@@ -336,8 +338,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// 如果换了新的leader，与新leader同步
 		if rf.leader != args.Leader {
-			rf.lastCommitLogIndex = args.LeaderLastCommitIndex
-			// todo 把不一致的notCommitMap和persister部分删除
+			if rf.lastCommitLogIndex > args.LeaderLastCommitIndex {
+				// 如果follower比leader的lastIndex大，需要丢弃不相同的部分。如果follower较小，则不用动
+				rf.lastCommitLogIndex = args.LeaderLastCommitIndex
+				// todo 把不一致的notCommitMap和persister部分删除
+			}
 			rf.leader = args.Leader
 		}
 		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
@@ -368,7 +373,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Accept = true
 		reply.ExpectLogIndex = rf.lastCommitLogIndex + 1
 
-		//log.Printf("rf:%v 生产appendCh follower", rf.me)
+		log.Printf("rf:%v 收到append idx:%v cmd:%v", rf.me, args.LogIndex, args.Command)
 		rf.appendCh <- 1
 	} else if rf.meIdentity == leader {
 		if args.LeaderTerm < rf.term {
@@ -384,23 +389,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//rf.meIdentity = follower
 		log.Fatalf("mutiple leaders exist")
 	}
-	if args.NeedWaitApply != true && args.LogIndex != -1 && args.Command != -1 {
+	if args.NeedWaitApply != true && args.LogIndex != -1 {
 		log.Printf("rf:%v ready to send applych idx:%v cmd:%v", rf.me, args.LogIndex, args.Command)
 		applyMsg := ApplyMsg{
-			CommandValid: true,
+			CommandValid: args.Command != -1,
 			Command:      args.Command,
 			CommandIndex: args.LogIndex,
 		}
 		delete(rf.notCommitCmdMap, args.LogIndex)
 		rf.applyCh <- applyMsg
+		rf.logPersister[args.LogIndex] = args.Command
 	}
 }
 
 func (rf *Raft) CommitEntries(args *CommitEntriesArgs, reply *CommitEntriesReply) {
-	// 收到了错序的commit消息，无视
 	rf.mu.Lock()
 	lastCommitLogIndex := rf.lastCommitLogIndex
 	rf.mu.Unlock()
+	// 收到了错序的commit消息，无视
 	if args.LogIndex > lastCommitLogIndex {
 		return
 	}
@@ -411,6 +417,7 @@ func (rf *Raft) CommitEntries(args *CommitEntriesArgs, reply *CommitEntriesReply
 		CommandIndex: args.LogIndex,
 	}
 	rf.applyCh <- applyMsg
+	rf.logPersister[args.LogIndex] = args.Command
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -464,6 +471,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			log.Printf("没有卡主")
 		}
 	}
+	if ok {
+		rf.lastReceiveFollowerDate = time.Now()
+		log.Printf("rf:%v lastReceiveFollower:%v", rf.me, rf.lastReceiveFollowerDate)
+	}
 
 	return ok
 }
@@ -495,7 +506,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return 0, 0, false
 	}
 
-	log.Printf("rf:%v 收到命令 cmd:%v", rf.me, command)
+	log.Printf("rf:%v 收到命令 cmd:%v rfIdentity:%v %v", rf.me, command, rf.meIdentity, time.Now())
 	rf.mu.Lock()
 	rf.nextLogIndex++
 	index = rf.nextLogIndex
@@ -520,6 +531,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.lastCommitLogIndex = index
 		}
 		rf.applyCh <- applyMsg
+		rf.logPersister[index] = command
 		log.Printf("rf:%v receive reply client idx:%v", rf.me, index)
 	case <-time.After(2 * (minElectionTimeout + electionTimeoutInterval*time.Millisecond)):
 		// 关闭logEntry.commitCh，防止收集follower回复的goroutine阻塞
@@ -537,6 +549,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			CommandIndex: index,
 		}
 		rf.applyCh <- applyMsg
+		rf.logPersister[index] = -1
 		log.Printf("等待apply回复超时，通知客户端本次命令执行失败 idx:%v cmd:%v", index, command)
 	}
 
@@ -611,6 +624,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.sendQueue = make([]*list.List, len(rf.peers))
 	rf.notCommitCmdMap = map[int]interface{}{}
+	rf.logPersister = map[int]interface{}{}
 
 	file := "./" + "log" + ".txt"
 	logFile, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
@@ -683,6 +697,13 @@ func (rf *Raft) checkAppendEntries() {
 }
 
 func (rf *Raft) sendHeartbeat() {
+	log.Printf("rf:%v 判断%v %v", rf.me, time.Since(rf.lastReceiveFollowerDate), time.Duration(electionTimeoutInterval)*time.Millisecond+minElectionTimeout)
+	if time.Since(rf.lastReceiveFollowerDate) > time.Duration(electionTimeoutInterval)*time.Millisecond+minElectionTimeout {
+		log.Printf("rf:%v 超越最长的选举timeout，不会再是leader了", rf.me)
+		rf.meIdentity = follower
+		rf.mu.Unlock()
+		return
+	}
 	prevNow := time.Now()
 
 	// 本轮日志发送的reply收集channel
@@ -707,8 +728,6 @@ func (rf *Raft) sendHeartbeat() {
 		command = nil
 	}
 
-	log.Printf("rf:%v add to send queue idx:%v cmd:%v", rf.me, logIndex, command)
-
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -725,6 +744,7 @@ func (rf *Raft) sendHeartbeat() {
 		}
 		// 添加到发送队列
 		rf.sendQueue[i].PushBack(args)
+		log.Printf("rf:%v add to send queue server:%v idx:%v cmd:%v", rf.me, i, logIndex, command)
 	}
 
 	rf.mu.Unlock()
@@ -742,6 +762,7 @@ func (rf *Raft) collectAppendReply(commitCh chan int, replyCh chan int, replyChS
 	currReplies := 0
 	// todo collect部分需不需要阻塞，这条日志没完成的话，可以继续发下一条日志吗？
 	// todo answer 暂时设计为不可继续发送，原因同下
+	minElectionTimeoutCh := time.After(minElectionTimeout)
 CollectLogReply:
 	for {
 		select {
@@ -770,13 +791,34 @@ CollectLogReply:
 				break CollectLogReply
 			}
 
-			//case <-time.After(minElectionTimeout + electionTimeoutInterval*time.Millisecond):
-			//	rf.mu.Lock()
-			//	stopSignal = true
-			//	close(replyCh)
-			//	rf.mu.Unlock()
-			//	log.Printf("等待append回复超时")
-			//	break CollectLogReply
+			//每一小段时间起来看一下start方法那边是否已经通知超时了
+		case <-time.After(electionTimeoutInterval * time.Millisecond):
+			select {
+			case <-commitCh:
+				// 能读出数据，说明logEntry.commitCh那边超时了，放了一个1进去，并且把channel关闭了，不能commit了
+				log.Printf("等待append回复超时，idx:%v 命令无效", logIndex)
+				rf.mu.Lock()
+				*replyChStopSignal = true
+				close(replyCh)
+				rf.mu.Unlock()
+				break CollectLogReply
+
+			default:
+				// 没有超时，重复for-select
+				log.Printf("rf:%v leader等待append回复没有超时 idx:%v cmd:%v", rf.me, logIndex, command)
+			}
+
+			// 因为这里collectReply是阻塞的，这里阻塞住就会读不到start方法传来的命令
+			// 如果logIndex=-1，就没必要继续卡住收集reply了
+		case <-minElectionTimeoutCh:
+			if logIndex == -1 {
+				log.Printf("等待append回复超时，idx:%v 命令无效", logIndex)
+				rf.mu.Lock()
+				*replyChStopSignal = true
+				close(replyCh)
+				rf.mu.Unlock()
+				break CollectLogReply
+			}
 		}
 	}
 }
@@ -857,6 +899,8 @@ CollectVotes:
 	if voteRes == voteSuccess {
 		// 选举成功
 		log.Printf("rf:%v elect success", rf.me)
+		// 初始化lastReceiveFollowerDate
+		rf.lastReceiveFollowerDate = time.Now()
 		// 初始化发送列表
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
@@ -905,7 +949,7 @@ func (rf *Raft) processSendQueue(server int) {
 		rf.mu.Unlock()
 		if !isLeader {
 			// 清空sendQueue
-			log.Printf("found myself not leader, remove all elements in send queue")
+			log.Printf("rf:%v found myself not leader, remove all elements in send queue", rf.me)
 			for node := rf.sendQueue[server].Front(); node != nil; node = node.Next() {
 				rf.sendQueue[server].Remove(node)
 			}
@@ -926,74 +970,108 @@ func (rf *Raft) processSendQueue(server int) {
 			log.Printf("leader receive append reply server:%v ok:%v, accept:%v ,expect:%v", server, ok, reply.Accept, reply.ExpectLogIndex)
 			if !ok {
 				// !ok 直接重发
-			} else if reply.Accept == false {
-				// ok但是不接受，查看是不是因为错序了
-				if reply.ExpectLogIndex != -1 {
-					// 遍历这个server的queue，找到expect后放到头部第一个重发
-					found := false
-					for node := rf.sendQueue[server].Front(); node != nil; node = node.Next() {
-						if node.Value.(*AppendEntriesArgs).LogIndex == reply.ExpectLogIndex {
-							found = true
-							rf.sendQueue[server].MoveToFront(node)
-						}
-					}
-					if found != true {
-						rf.mu.Lock()
-						if cmd, ok1 := rf.notCommitCmdMap[reply.ExpectLogIndex]; ok1 {
-							stopSigal := true
-							argsFromMap := AppendEntriesArgs{
-								Leader:                rf.me,
-								LeaderTerm:            args.LeaderTerm,
-								LogIndex:              reply.ExpectLogIndex,
-								Command:               cmd,
-								ReplyCh:               nil,
-								ReplyChStopSignal:     &stopSigal,
-								NeedWaitApply:         false,
-								LeaderLastCommitIndex: rf.lastCommitLogIndex,
-							}
-							reply := AppendEntriesReply{}
-							rf.sendAppendEntries(server, &argsFromMap, &reply)
-						} else {
-							log.Printf("not found idx:%v need to find from persist", reply.ExpectLogIndex)
-						}
-						rf.mu.Unlock()
-					}
-				}
 			} else {
-				// 一切正常
-				rf.sendQueue[server].Remove(front)
-				// 查看是否需要调整队列优先级
-				rf.mu.Lock()
-				lastCommitLogIndex := rf.lastCommitLogIndex
-				rf.mu.Unlock()
-				if reply.ExpectLogIndex != -1 && reply.ExpectLogIndex <= lastCommitLogIndex {
-					// 遍历这个server的queue，找到expect后放到头部第一个重发
-					found := false
-					for node := rf.sendQueue[server].Front(); node != nil; node = node.Next() {
-						if node.Value.(*AppendEntriesArgs).LogIndex == reply.ExpectLogIndex {
-							found = true
-							rf.sendQueue[server].MoveToFront(node)
+				//ok
+				if reply.Accept == false {
+					// ok但是不接受，查看是不是因为错序了
+					if reply.ExpectLogIndex != -1 {
+						// 遍历这个server的queue，找到expect后放到头部第一个重发
+						found := false
+						for node := rf.sendQueue[server].Front(); node != nil; node = node.Next() {
+							if node.Value.(*AppendEntriesArgs).LogIndex == reply.ExpectLogIndex {
+								found = true
+								rf.sendQueue[server].MoveToFront(node)
+							}
+						}
+						// 发送队列没找到，看看是不是notCommitMap里面
+						if found != true {
+							rf.mu.Lock()
+							if cmd, ok1 := rf.notCommitCmdMap[reply.ExpectLogIndex]; ok1 {
+								stopSigal := true
+								argsFromMap := AppendEntriesArgs{
+									Leader:                rf.me,
+									LeaderTerm:            args.LeaderTerm,
+									LogIndex:              reply.ExpectLogIndex,
+									Command:               cmd,
+									ReplyCh:               nil,
+									ReplyChStopSignal:     &stopSigal,
+									NeedWaitApply:         false,
+									LeaderLastCommitIndex: rf.lastCommitLogIndex,
+								}
+								rf.mu.Unlock()
+								rf.sendQueue[server].PushFront(&argsFromMap)
+								//replyFromMap := AppendEntriesReply{}
+								//rf.sendAppendEntries(server, &argsFromMap, &replyFromMap)
+							} else {
+								log.Printf("not found idx:%v need to find from persist", reply.ExpectLogIndex)
+								expectCmd := rf.logPersister[reply.ExpectLogIndex]
+								stopSigal := true
+								argsFromPersist := AppendEntriesArgs{
+									Leader:                rf.me,
+									LeaderTerm:            args.LeaderTerm,
+									LogIndex:              reply.ExpectLogIndex,
+									Command:               expectCmd,
+									ReplyCh:               nil,
+									ReplyChStopSignal:     &stopSigal,
+									NeedWaitApply:         false,
+									LeaderLastCommitIndex: rf.lastCommitLogIndex,
+								}
+								rf.mu.Unlock()
+								rf.sendQueue[server].PushFront(&argsFromPersist)
+							}
 						}
 					}
-					if found != true {
-						rf.mu.Lock()
-						if cmd, ok1 := rf.notCommitCmdMap[reply.ExpectLogIndex]; ok1 {
-							stopSigal := true
-							argsFromMap := AppendEntriesArgs{
-								Leader:            rf.me,
-								LeaderTerm:        args.LeaderTerm,
-								LogIndex:          reply.ExpectLogIndex,
-								Command:           cmd,
-								ReplyCh:           nil,
-								ReplyChStopSignal: &stopSigal,
-								NeedWaitApply:     false,
+				} else {
+					// 一切正常
+					rf.sendQueue[server].Remove(front)
+					// 查看是否需要调整队列优先级
+					rf.mu.Lock()
+					lastCommitLogIndex := rf.lastCommitLogIndex
+					rf.mu.Unlock()
+					if reply.ExpectLogIndex != -1 && reply.ExpectLogIndex <= lastCommitLogIndex {
+						// 遍历这个server的queue，找到expect后放到头部第一个重发
+						found := false
+						for node := rf.sendQueue[server].Front(); node != nil; node = node.Next() {
+							if node.Value.(*AppendEntriesArgs).LogIndex == reply.ExpectLogIndex {
+								found = true
+								rf.sendQueue[server].MoveToFront(node)
 							}
-							reply := AppendEntriesReply{}
-							rf.sendAppendEntries(server, &argsFromMap, &reply)
-						} else {
-							log.Printf("not found idx:%v need to find from persist", reply.ExpectLogIndex)
 						}
-						rf.mu.Unlock()
+						if found != true {
+							rf.mu.Lock()
+							if cmd, ok1 := rf.notCommitCmdMap[reply.ExpectLogIndex]; ok1 {
+								stopSigal := true
+								argsFromMap := AppendEntriesArgs{
+									Leader:            rf.me,
+									LeaderTerm:        args.LeaderTerm,
+									LogIndex:          reply.ExpectLogIndex,
+									Command:           cmd,
+									ReplyCh:           nil,
+									ReplyChStopSignal: &stopSigal,
+									NeedWaitApply:     false,
+								}
+								rf.mu.Unlock()
+								rf.sendQueue[server].PushFront(&argsFromMap)
+								//replyFromMap := AppendEntriesReply{}
+								//rf.sendAppendEntries(server, &argsFromMap, &replyFromMap)
+							} else {
+								log.Printf("not found idx:%v need to find from persist", reply.ExpectLogIndex)
+								expectCmd := rf.logPersister[reply.ExpectLogIndex]
+								stopSigal := true
+								argsFromPersist := AppendEntriesArgs{
+									Leader:                rf.me,
+									LeaderTerm:            args.LeaderTerm,
+									LogIndex:              reply.ExpectLogIndex,
+									Command:               expectCmd,
+									ReplyCh:               nil,
+									ReplyChStopSignal:     &stopSigal,
+									NeedWaitApply:         false,
+									LeaderLastCommitIndex: rf.lastCommitLogIndex,
+								}
+								rf.mu.Unlock()
+								rf.sendQueue[server].PushFront(&argsFromPersist)
+							}
+						}
 					}
 				}
 			}

@@ -400,11 +400,13 @@ func TestRejoin2B(t *testing.T) {
 
 	// old leader connected again
 	cfg.connect(leader1)
+	log.Printf("recon %v", leader1)
 
 	cfg.one(104, 2, true)
 
 	// all together now
 	cfg.connect(leader2)
+	log.Printf("recon %v %v", leader2, time.Now())
 
 	cfg.one(105, servers, true)
 
