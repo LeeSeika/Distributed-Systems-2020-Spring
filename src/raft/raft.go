@@ -44,6 +44,8 @@ const (
 	newLeaderElectionTimeoutInterval = 500
 
 	appendEntriesInterval = 200 * time.Millisecond
+
+	pollCollectAppendReplyInterval = 50 * time.Millisecond
 )
 
 const (
@@ -105,6 +107,7 @@ type Raft struct {
 	term                          int
 	appendCh                      chan int
 	lastCommitLogIndex            int
+	lastReceiveLogIndex           int
 	nextLogIndex                  int
 	logCh                         chan *LogEntry
 	applyCh                       chan ApplyMsg
@@ -186,6 +189,7 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	ElectionTerm       int
 	LastCommitLogIndex int
+	Leader             int
 }
 
 // example RequestVote RPC reply structure.
@@ -229,20 +233,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	if rf.term >= args.ElectionTerm {
 		// 不是比当前更新的任期，投反对票
-		log.Printf("rf:%v term:%v vote down", rf.me, rf.term)
+		log.Printf("任期落后 rf:%v term:%v vote down to candidate:%v candidateTerm:%v", rf.me, rf.term, args.Leader, args.ElectionTerm)
 		reply.VoteUp = false
 		return
 	}
 
 	// 论文5.4.1 检查日志完整性，candidate完整性低的话投反对票
 	if rf.lastCommitLogIndex > args.LastCommitLogIndex {
-		log.Printf("rf:%v term:%v vote down", rf.me, rf.term)
+		log.Printf("日志不完整 rf:%v term:%v vote down to candidate:%v candidateTerm:%v", rf.me, rf.term, args.Leader, args.ElectionTerm)
 		reply.VoteUp = false
+		// 如果自己有更完整的日志，本应成为新的leader，但是因为没有跟上最新的选举任期节奏，接下来也一直跟不上
+		// 所以这种情况需要停掉本次选举，更新任期
+		rf.term = args.ElectionTerm
+		rf.appendCh <- 2
 		return
 	}
 
 	// 日志完整性校验通过，投赞成票
-	log.Printf("rf:%v term:%v vote up", rf.me, rf.term)
+	log.Printf("rf:%v term:%v vote up to candidate:%v candidateTerm:%v", rf.me, rf.term, args.Leader, args.ElectionTerm)
 	if rf.meIdentity == leader {
 		// 剥夺leader权力
 		rf.meIdentity = follower
@@ -271,7 +279,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.meIdentity = follower
 				// 通知正在发送voteRequest的goroutine停止
 				//log.Printf("rf:%v 生产appendCh candidate", rf.me)
-				rf.appendCh <- 1
+				rf.appendCh <- 2
 				rf.lastReceivedAppendEntriesDate = time.Now()
 				// 走到这里虽然发现是自己的网络问题了，但是依然要无视，因为这条append RPC的logIndex > rf.lastCommitLogIndex+1
 				// 是不连续的日志，我们期望的是rf.lastCommitLogIndex+1的日志，所以我们现在还不能接受
@@ -300,7 +308,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.meIdentity = follower
 				// 通知正在发送voteRequest的goroutine停止
 				//log.Printf("rf:%v 生产appendCh candidate", rf.me)
-				rf.appendCh <- 1
+				rf.appendCh <- 2
 				rf.lastReceivedAppendEntriesDate = time.Now()
 				// 走到这里虽然发现是自己的网络问题了，但是依然要无视，因为这条append RPC的logIndex > rf.lastCommitLogIndex+1
 				// 是不连续的日志，我们期望的是rf.lastCommitLogIndex+1的日志，所以我们现在还不能接受
@@ -319,14 +327,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.lastReceivedAppendEntriesDate = time.Now()
 		// 更新日志状态
 		if args.LogIndex != -1 {
-			rf.lastCommitLogIndex = args.LogIndex
+			log.Printf("(2)rf:%v 更新lastIdx%v为%v", rf.me, rf.lastReceiveLogIndex, args.LogIndex)
+			// rf.lastCommitLogIndex = args.LogIndex
+			rf.lastReceiveLogIndex = args.LogIndex
 		}
 		reply.Accept = true
-		reply.ExpectLogIndex = rf.lastCommitLogIndex + 1
+		if rf.lastReceiveLogIndex < rf.lastCommitLogIndex {
+			rf.lastReceiveLogIndex = rf.lastCommitLogIndex
+		}
+		reply.ExpectLogIndex = rf.lastReceiveLogIndex + 1
 		rf.notCommitCmdMap[args.LogIndex] = args.Command
 
 		//log.Printf("rf:%v 生产appendCh candidate", rf.me)
-		rf.appendCh <- 1
+		rf.appendCh <- 2
 	} else if rf.meIdentity == follower {
 		// 检查任期（针对可能两个leader同时存在的情况，旧leader发的append不理会）
 		if args.LeaderTerm < rf.term {
@@ -337,10 +350,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 		// 如果换了新的leader，与新leader同步
+		hasChangedLeader := false
 		if rf.leader != args.Leader {
+			hasChangedLeader = true
 			if rf.lastCommitLogIndex > args.LeaderLastCommitIndex {
 				// 如果follower比leader的lastIndex大，需要丢弃不相同的部分。如果follower较小，则不用动
+				log.Printf("(3)rf:%v 更新lastIdx%v为%v", rf.me, rf.lastReceiveLogIndex, args.LogIndex)
 				rf.lastCommitLogIndex = args.LeaderLastCommitIndex
+				rf.lastReceiveLogIndex = rf.lastCommitLogIndex
 				// todo 把不一致的notCommitMap和persister部分删除
 			}
 			rf.leader = args.Leader
@@ -348,9 +365,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
 		// 但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
 		// 当args.logIndex == -1的时候是一条空心跳包，接受它
-		if args.LogIndex != -1 && rf.lastCommitLogIndex >= args.LogIndex {
+		if args.LogIndex != -1 && rf.lastCommitLogIndex >= args.LogIndex && !hasChangedLeader {
 			reply.Accept = true
-			reply.ExpectLogIndex = rf.lastCommitLogIndex + 1
+			if rf.lastReceiveLogIndex < rf.lastCommitLogIndex {
+				rf.lastReceiveLogIndex = rf.lastCommitLogIndex
+			}
+			reply.ExpectLogIndex = rf.lastReceiveLogIndex + 1
 			rf.lastReceivedAppendEntriesDate = time.Now()
 			return
 		}
@@ -365,13 +385,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// 更新日志状态
 		if args.LogIndex != -1 {
-			rf.lastCommitLogIndex = args.LogIndex
+			log.Printf("(4)rf:%v 更新lastIdx%v为%v", rf.me, rf.lastReceiveLogIndex, args.LogIndex)
+			rf.lastReceiveLogIndex = args.LogIndex
 		}
 		rf.notCommitCmdMap[args.LogIndex] = args.Command
 		rf.term = args.LeaderTerm
 		rf.lastReceivedAppendEntriesDate = time.Now()
 		reply.Accept = true
-		reply.ExpectLogIndex = rf.lastCommitLogIndex + 1
+		if rf.lastReceiveLogIndex < rf.lastCommitLogIndex {
+			rf.lastReceiveLogIndex = rf.lastCommitLogIndex
+		}
+		reply.ExpectLogIndex = rf.lastReceiveLogIndex + 1
 
 		log.Printf("rf:%v 收到append idx:%v cmd:%v", rf.me, args.LogIndex, args.Command)
 		rf.appendCh <- 1
@@ -397,6 +421,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			CommandIndex: args.LogIndex,
 		}
 		delete(rf.notCommitCmdMap, args.LogIndex)
+		rf.lastCommitLogIndex = args.LogIndex
 		rf.applyCh <- applyMsg
 		rf.logPersister[args.LogIndex] = args.Command
 	}
@@ -405,11 +430,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) CommitEntries(args *CommitEntriesArgs, reply *CommitEntriesReply) {
 	rf.mu.Lock()
 	lastCommitLogIndex := rf.lastCommitLogIndex
-	rf.mu.Unlock()
 	// 收到了错序的commit消息，无视
-	if args.LogIndex > lastCommitLogIndex {
+	if args.LogIndex != lastCommitLogIndex+1 {
+		rf.mu.Unlock()
 		return
 	}
+	rf.lastCommitLogIndex++
+	rf.mu.Unlock()
 	log.Printf("ready to send applych %v", rf.me)
 	applyMsg := ApplyMsg{
 		CommandValid: true,
@@ -417,6 +444,7 @@ func (rf *Raft) CommitEntries(args *CommitEntriesArgs, reply *CommitEntriesReply
 		CommandIndex: args.LogIndex,
 	}
 	rf.applyCh <- applyMsg
+	delete(rf.notCommitCmdMap, args.LogIndex)
 	rf.logPersister[args.LogIndex] = args.Command
 }
 
@@ -466,9 +494,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	defer rf.mu.Unlock()
 	if ok && reply.Accept {
 		if *stopSignal != true {
-			log.Printf("rf:%v 这里发送replyCh，来自server:%v idx:%v ok:%v accept:%v", rf.me, server, args.LogIndex, ok, reply.Accept)
+			//log.Printf("rf:%v 这里发送replyCh，来自server:%v idx:%v ok:%v accept:%v", rf.me, server, args.LogIndex, ok, reply.Accept)
 			replyCh <- 1
-			log.Printf("没有卡主")
+			//log.Printf("没有卡主")
 		}
 	}
 	if ok {
@@ -528,11 +556,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			CommandIndex: index,
 		}
 		if rf.lastCommitLogIndex < index {
+			log.Printf("(1)rf:%v 更新lastIdx%v为%v", rf.me, rf.lastCommitLogIndex, index)
 			rf.lastCommitLogIndex = index
 		}
 		rf.applyCh <- applyMsg
 		rf.logPersister[index] = command
-		log.Printf("rf:%v receive reply client idx:%v", rf.me, index)
+		log.Printf("rf:%v receive reply client idx:%v cmd:%v", rf.me, index, command)
 	case <-time.After(2 * (minElectionTimeout + electionTimeoutInterval*time.Millisecond)):
 		// 关闭logEntry.commitCh，防止收集follower回复的goroutine阻塞
 		rf.mu.Lock()
@@ -620,11 +649,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.appendCh = make(chan int, 1000*len(rf.peers))
 	rf.logCh = make(chan *LogEntry, len(rf.peers))
 	rf.lastCommitLogIndex = 0
+	rf.lastReceiveLogIndex = 0
 	rf.nextLogIndex = 0
 	rf.applyCh = applyCh
 	rf.sendQueue = make([]*list.List, len(rf.peers))
 	rf.notCommitCmdMap = map[int]interface{}{}
 	rf.logPersister = map[int]interface{}{}
+	rf.leader = -1
 
 	file := "./" + "log" + ".txt"
 	logFile, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
@@ -666,9 +697,9 @@ func (rf *Raft) checkAppendEntries() {
 			select {
 			case <-rf.appendCh:
 				// 新的leader已经发消息来了，解除睡眠
-				// 因为appendCh带缓冲区，所以要清空可能囤积的消息
-				//for _ = range rf.appendCh {
-				//}
+				//因为appendCh带缓冲区，所以要清空可能囤积的消息
+				for _ = range rf.appendCh {
+				}
 				//log.Printf("rf:%v 消费appendCh 新任期超时唤醒", rf.me)
 				return
 			case <-ctx.Done():
@@ -691,6 +722,8 @@ func (rf *Raft) checkAppendEntries() {
 		//log.Printf("rf:%v lastIdx:%v 没有超时", rf.me, rf.lastCommitLogIndex)
 		rf.mu.Unlock()
 		<-rf.appendCh
+		//for _ = range rf.appendCh {
+		//}
 		//log.Printf("rf:%v 消费appendCh follower没有超时", rf.me)
 
 	}
@@ -762,7 +795,7 @@ func (rf *Raft) collectAppendReply(commitCh chan int, replyCh chan int, replyChS
 	currReplies := 0
 	// todo collect部分需不需要阻塞，这条日志没完成的话，可以继续发下一条日志吗？
 	// todo answer 暂时设计为不可继续发送，原因同下
-	minElectionTimeoutCh := time.After(minElectionTimeout)
+	minElectionTimeoutCh := time.After(appendEntriesInterval)
 CollectLogReply:
 	for {
 		select {
@@ -792,7 +825,7 @@ CollectLogReply:
 			}
 
 			//每一小段时间起来看一下start方法那边是否已经通知超时了
-		case <-time.After(electionTimeoutInterval * time.Millisecond):
+		case <-time.After(pollCollectAppendReplyInterval):
 			select {
 			case <-commitCh:
 				// 能读出数据，说明logEntry.commitCh那边超时了，放了一个1进去，并且把channel关闭了，不能commit了
@@ -848,6 +881,7 @@ func (rf *Raft) startNewElection() {
 		args := RequestVoteArgs{
 			ElectionTerm:       electionTerm,
 			LastCommitLogIndex: rf.lastCommitLogIndex,
+			Leader:             rf.me,
 		}
 		reply := RequestVoteReply{}
 		// 投票RPC新开一个goroutine去处理，当那些goroutine接收到reply时，通知这个goroutine
@@ -874,6 +908,7 @@ CollectVotes:
 					// 收到反对票
 					// 如果已经有半数或以上节点投了反对票，选举失败
 					if 2*(voteAllReplies-voteUpNumbers) >= len(rf.peers) {
+						log.Printf("rf:%v electionTerm:%v 收到一半以上的反对票", rf.me, electionTerm)
 						voteRes = voteFail
 						break CollectVotes
 					}
@@ -885,10 +920,14 @@ CollectVotes:
 			voteRes = voteTimeout
 			break CollectVotes
 		// 如果在此期间收到了新leader的RPC，说明从这里变回follower状态
-		case <-rf.appendCh:
+		case fromAppendCh := <-rf.appendCh:
 			//log.Printf("rf:%v 消费appendCh", rf.me)
-			voteRes = voteFail
-			break CollectVotes
+			// 判断appendCh里面的消息，读出来==2的时候才是voteFail的情况，其他都是堆积的无效消息
+			if fromAppendCh == 2 {
+				log.Printf("rf:%v electionTerm:%v append ch", rf.me, electionTerm)
+				voteRes = voteFail
+				break CollectVotes
+			}
 		}
 	}
 	// 释放ctx资源
@@ -918,7 +957,7 @@ CollectVotes:
 		rf.meIdentity = leader
 	} else if voteRes == voteFail {
 		// 选举失败
-		log.Printf("选举失败")
+		log.Printf("rf:%v 选举失败", rf.me)
 		rf.meIdentity = follower
 	} else if voteRes == voteTimeout {
 		// 超时，重新选举
