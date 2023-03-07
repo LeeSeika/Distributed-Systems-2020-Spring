@@ -244,8 +244,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteUp = false
 		// 如果自己有更完整的日志，本应成为新的leader，但是因为没有跟上最新的选举任期节奏，接下来也一直跟不上
 		// 所以这种情况需要停掉本次选举，更新任期
-		rf.term = args.ElectionTerm
-		rf.appendCh <- 2
+		if rf.meIdentity == candidate {
+			rf.term = args.ElectionTerm
+			rf.appendCh <- 2
+		}
 		return
 	}
 
@@ -284,6 +286,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// 走到这里虽然发现是自己的网络问题了，但是依然要无视，因为这条append RPC的logIndex > rf.lastCommitLogIndex+1
 				// 是不连续的日志，我们期望的是rf.lastCommitLogIndex+1的日志，所以我们现在还不能接受
 				// 我们把任期和identity恢复后，下一次收到leader重试的rf.lastCommitLogIndex+1后就能恢复正常了
+				// rf.checkNeedAutoCommitLastEntry(args)
 				log.Printf("true from 2")
 				reply.Accept = false
 				reply.ExpectLogIndex = rf.lastCommitLogIndex + 1
@@ -325,6 +328,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.term = args.LeaderTerm
 		// 通知正在发送voteRequest的goroutine停止
 		rf.lastReceivedAppendEntriesDate = time.Now()
+		// rf.checkNeedAutoCommitLastEntry(args)
+		// 把notCommitMap删除，上一个leader未commit的数据轮到下一个leader的时候，可能会出现同样的index不同command的情况
+		// 我们需要以新的leader为准，所以把未commit的部分删除
+		rf.lastReceiveLogIndex = rf.lastCommitLogIndex
+		for k, _ := range rf.notCommitCmdMap {
+			delete(rf.notCommitCmdMap, k)
+		}
 		// 更新日志状态
 		if args.LogIndex != -1 {
 			log.Printf("(2)rf:%v 更新lastIdx%v为%v", rf.me, rf.lastReceiveLogIndex, args.LogIndex)
@@ -332,9 +342,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.lastReceiveLogIndex = args.LogIndex
 		}
 		reply.Accept = true
-		if rf.lastReceiveLogIndex < rf.lastCommitLogIndex {
-			rf.lastReceiveLogIndex = rf.lastCommitLogIndex
-		}
 		reply.ExpectLogIndex = rf.lastReceiveLogIndex + 1
 		rf.notCommitCmdMap[args.LogIndex] = args.Command
 
@@ -358,10 +365,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				log.Printf("(3)rf:%v 更新lastIdx%v为%v", rf.me, rf.lastReceiveLogIndex, args.LogIndex)
 				rf.lastCommitLogIndex = args.LeaderLastCommitIndex
 				rf.lastReceiveLogIndex = rf.lastCommitLogIndex
-				// todo 把不一致的notCommitMap和persister部分删除
+			}
+			// 把notCommitMap删除，上一个leader未commit的数据轮到下一个leader的时候，可能会出现同样的index不同command的情况
+			// 我们需要以新的leader为准，所以把未commit的部分删除
+			rf.lastReceiveLogIndex = rf.lastCommitLogIndex
+			for k, _ := range rf.notCommitCmdMap {
+				delete(rf.notCommitCmdMap, k)
 			}
 			rf.leader = args.Leader
 		}
+		if !hasChangedLeader {
+			rf.checkNeedAutoCommitLastEntry(args)
+		}
+
 		// 论文5.5 一个 follower 如果接收了一个 AppendEntries 请求
 		// 但是这个请求里面的这些日志条目在它日志中已经有了，它就会直接忽略这个新的请求中的这些日志条目。
 		// 当args.logIndex == -1的时候是一条空心跳包，接受它
@@ -382,7 +398,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.ExpectLogIndex = rf.lastCommitLogIndex + 1
 			return
 		}
-
 		// 更新日志状态
 		if args.LogIndex != -1 {
 			log.Printf("(4)rf:%v 更新lastIdx%v为%v", rf.me, rf.lastReceiveLogIndex, args.LogIndex)
@@ -424,6 +439,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.lastCommitLogIndex = args.LogIndex
 		rf.applyCh <- applyMsg
 		rf.logPersister[args.LogIndex] = args.Command
+	}
+}
+
+func (rf *Raft) checkNeedAutoCommitLastEntry(args *AppendEntriesArgs) {
+	if args.LeaderLastCommitIndex >= rf.lastReceiveLogIndex && rf.lastReceiveLogIndex > rf.lastCommitLogIndex {
+		log.Printf("rf:%v auto applych idx:%v cmd:%v currLogIdx:%v currLogCmd:%v currLeaderLastCommit:%v", rf.me, rf.lastReceiveLogIndex, rf.notCommitCmdMap[rf.lastReceiveLogIndex], args.LogIndex, args.Command, args.LeaderLastCommitIndex)
+		applyMsg := ApplyMsg{
+			CommandValid: rf.notCommitCmdMap[rf.lastReceiveLogIndex] != -1,
+			Command:      rf.notCommitCmdMap[rf.lastReceiveLogIndex],
+			CommandIndex: rf.lastReceiveLogIndex,
+		}
+		delete(rf.notCommitCmdMap, args.LogIndex)
+		rf.lastCommitLogIndex = rf.lastReceiveLogIndex
+		rf.applyCh <- applyMsg
+		rf.logPersister[applyMsg.CommandIndex] = applyMsg.Command
 	}
 }
 
@@ -814,9 +844,9 @@ CollectLogReply:
 						// 能读出数据，说明logEntry.commitCh那边超时了，放了一个1进去，并且把channel关闭了，不能commit了
 						log.Printf("等待append回复超时，idx:%v 命令无效", logIndex)
 					default:
-						log.Printf("rf:%v send commit idx:%v currReplies:%v len(peers):%v", rf.me, logIndex, currReplies, len(rf.peers))
+						//log.Printf("rf:%v send commit idx:%v currReplies:%v len(peers):%v", rf.me, logIndex, currReplies, len(rf.peers))
 						commitCh <- 1
-						rf.sendCommitRPC(logIndex, command)
+						//rf.sendCommitRPC(logIndex, command)
 					}
 				}
 				close(replyCh)

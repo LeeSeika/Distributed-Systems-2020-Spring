@@ -518,6 +518,7 @@ loop:
 
 		leader = cfg.checkOneLeader()
 		total1 = rpcs()
+		log.Printf("【Test】try:%v total1:%v", try, total1)
 
 		iters := 10
 		starti, term, ok := cfg.rafts[leader].Start(1)
@@ -562,7 +563,10 @@ loop:
 				// need to keep going to update total2
 				failed = true
 			}
-			total2 += cfg.rpcCount(j)
+			//total2 += cfg.rpcCount(j)
+			c := cfg.rpcCount(j)
+			total2 += c
+			log.Printf("【test】j=%v, count=%v total2=%v", j, c, total2)
 		}
 
 		if failed {
