@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"container/list"
 	"context"
 	"log"
@@ -137,12 +139,14 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.lastCommitLogIndex)
+	e.Encode(rf.term)
+	e.Encode(rf.leader)
+	e.Encode(rf.logPersister)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -152,17 +156,23 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var lastCommitLogIndex int
+	var term int
+	var leader int
+	var logPersister map[int]interface{}
+	if d.Decode(&lastCommitLogIndex) != nil ||
+		d.Decode(&term) != nil ||
+		d.Decode(&leader) != nil ||
+		d.Decode(&logPersister) != nil {
+		log.Fatalf("error read persist")
+	} else {
+		rf.lastCommitLogIndex = lastCommitLogIndex
+		rf.term = term
+		rf.leader = leader
+		rf.logPersister = logPersister
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -264,6 +274,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	//if args.LogIndex != -1 {
 	log.Printf("rf:%v follower receive idx:%v status:%v, lsatIdx:%v", rf.me, args.LogIndex, rf.meIdentity, rf.lastCommitLogIndex)
@@ -611,6 +622,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logPersister[index] = -1
 		log.Printf("等待apply回复超时，通知客户端本次命令执行失败 idx:%v cmd:%v", index, command)
 	}
+	rf.persist()
+	log.Printf("rf:%v leader persist 成功", rf.me)
 
 	return index, term, isLeader
 }
@@ -679,8 +692,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.appendCh = make(chan int, 1000*len(rf.peers))
 	rf.logCh = make(chan *LogEntry, len(rf.peers))
 	rf.lastCommitLogIndex = 0
-	rf.lastReceiveLogIndex = 0
-	rf.nextLogIndex = 0
 	rf.applyCh = applyCh
 	rf.sendQueue = make([]*list.List, len(rf.peers))
 	rf.notCommitCmdMap = map[int]interface{}{}
@@ -696,6 +707,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.lastReceiveLogIndex = rf.lastCommitLogIndex
+	rf.nextLogIndex = rf.lastCommitLogIndex
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
