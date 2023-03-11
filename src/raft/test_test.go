@@ -10,6 +10,7 @@ package raft
 
 import (
 	"log"
+	"os"
 	"testing"
 )
 import "fmt"
@@ -21,6 +22,14 @@ import "sync"
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
+
+func TestMassTimes(t *testing.T) {
+	for testCount := 0; testCount < 10; testCount++ {
+		file := "./" + "log" + ".txt"
+		os.Remove(file)
+		TestManyElections2A(t)
+	}
+}
 
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
