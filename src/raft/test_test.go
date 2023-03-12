@@ -25,9 +25,10 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 
 func TestMassTimes(t *testing.T) {
 	for testCount := 0; testCount < 10; testCount++ {
+		time.Sleep(time.Second * 3)
 		file := "./" + "log" + ".txt"
 		os.Remove(file)
-		TestManyElections2A(t)
+		TestBasicAgree2B(t)
 	}
 }
 

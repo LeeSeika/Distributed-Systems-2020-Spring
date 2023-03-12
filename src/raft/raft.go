@@ -22,8 +22,6 @@ import (
 	"log"
 	"math"
 	"math/rand"
-	"os"
-
 	//	"bytes"
 	"sync"
 	"sync/atomic"
@@ -46,6 +44,8 @@ const (
 	appendEntriesInterval = 200 * time.Millisecond
 
 	pollCollectClientCmdInterval = 50 * time.Millisecond
+
+	minSleepInterval = 5 * time.Millisecond
 )
 
 const (
@@ -84,11 +84,10 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	LogTerm  int
-	Command  interface{}
-	Index    int
-	CommitCh chan bool
-	// Lab required
+	LogTerm           int
+	Command           interface{}
+	Index             int
+	CommitCh          chan bool
 	ReplyCh           chan int
 	ReplyChStopSignal *bool
 }
@@ -121,6 +120,7 @@ type Raft struct {
 	appendCh                      chan int
 	lastReceivedAppendEntriesDate time.Time
 	lastReceiveFollowerDate       time.Time //用于leader判断自己是否脱离集群，失去leader地位了
+	processedIndex                int       // 记录已经经过sendHeartbeat方法处理的最大日志编号
 
 	//term                          int
 
@@ -340,7 +340,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 判断前一条日志的任期是否符合
 	if args.PrevLogIndex > len(rf.log)+1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].LogTerm {
-		log.Printf("rf:%v 日志错序 args.PrevLogIdx:%v args.PrevLogTerm:%v rf.log[%v].LogTerm:%v", rf.me, args.PrevLogIndex, args.PrevLogTerm, args.PrevLogIndex, rf.log[args.PrevLogIndex].LogTerm)
+		// 仅仅是打log的一个判断
+		if args.PrevLogIndex <= len(rf.log)+1 {
+			log.Printf("rf:%v 日志错序 args.PrevLogIdx:%v args.PrevLogTerm:%v rf.log[%v].LogTerm:%v", rf.me, args.PrevLogIndex, args.PrevLogTerm, args.PrevLogIndex, rf.log[args.PrevLogIndex].LogTerm)
+		}
 		log.Printf("%v", len(rf.log))
 		reply.Success = false
 		reply.Term = rf.currTerm
@@ -357,10 +360,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		entryFromLeader := args.Entries[i]
 		log.Printf("rf:%v 收到append idx:%v cmd:%v", rf.me, entryFromLeader.Index, entryFromLeader.Command)
 		entry := &LogEntry{
-			LogTerm:  entryFromLeader.LogTerm,
-			Command:  entryFromLeader.Command,
-			Index:    entryFromLeader.Index,
-			CommitCh: nil,
+			LogTerm: entryFromLeader.LogTerm,
+			Command: entryFromLeader.Command,
+			Index:   entryFromLeader.Index,
 		}
 
 		if entry.Index < len(rf.log) {
@@ -442,11 +444,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if ok && reply.Success {
-		if stopSignal != nil && *stopSignal != true {
-			//log.Printf("rf:%v 这里发送replyCh，来自server:%v idx:%v ok:%v accept:%v", rf.me, server, args.LogIndex, ok, reply.Accept)
-			replyCh <- 1
-			//log.Printf("没有卡主")
+	if ok {
+		rf.lastReceiveFollowerDate = time.Now()
+		if reply.Success {
+			if stopSignal != nil && *stopSignal != true {
+				log.Printf("rf:%v 这里发送replyCh，来自server:%v ok:%v accept:%v", rf.me, server, ok, reply.Success)
+				replyCh <- 1
+				log.Printf("没有卡主")
+			}
 		}
 	}
 
@@ -476,16 +481,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return 0, 0, false
 	}
 
-	log.Printf("rf:%v 收到命令 cmd:%v rfIdentity:%v %v", rf.me, command, rf.meIdentity, time.Now())
 	rf.mu.Lock()
 	index = rf.nextIndex[rf.me]
+	log.Printf("rf:%v 收到命令 cmd:%v idx:%v rfIdentity:%v %v", rf.me, command, index, rf.meIdentity, time.Now())
+	rf.nextIndex[rf.me]++
 	signal := false
 	logEntry := LogEntry{
 		LogTerm:           rf.currTerm,
 		Command:           command,
 		Index:             index,
 		CommitCh:          make(chan bool, 1),
-		ReplyCh:           make(chan int, 1),
+		ReplyCh:           make(chan int, len(rf.peers)),
 		ReplyChStopSignal: &signal,
 	}
 	rf.log = append(rf.log, &logEntry)
@@ -502,12 +508,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.applyCh <- msg
 			// todo persist
 		} else {
-			// 删除之前添加的那条日志
 			rf.mu.Lock()
-			rf.log = rf.log[:len(rf.log)]
+			// 同时更新follower的matchIndex和nextIndex
+			log.Printf("rf:%v 修复已经接受到valid=false命令的nextIndex和matchIndexIndex", rf.me)
+			for i := 0; i < len(rf.peers); i++ {
+				if rf.me == i {
+					continue
+				}
+				// 有一部分节点已经接收到valid=true的包了，我们把他们的matchIndex和nextIndex减少
+				// 下次给他们发心跳的时候就会发valid=false版本的RPC，他们就能覆盖掉valid=true的版本
+				log.Printf("rf:%v server:%v matchidx:%v invalidIndex:%v", rf.me, i, rf.matchIndex[i], index)
+				if rf.matchIndex[i] >= index {
+					rf.matchIndex[i] = index - 1
+					rf.nextIndex[i] = index
+				}
+			}
+			// 删除这条log，并且更新log数组元素的index
+			rf.log = append(rf.log[:index], rf.log[index+1:]...)
+			for idx := index; idx < len(rf.log); idx++ {
+				log.Printf("rf:%v 超时后更新索引 log[%v].Index=%v 更新为Index=%v", rf.me, idx, rf.log[idx].Index, idx)
+				rf.log[idx].Index = idx
+			}
+			rf.nextIndex[rf.me]--
+			rf.processedIndex--
 			rf.mu.Unlock()
-			// 返回客户端失败
-			return 0, 0, false
 		}
 	}
 
@@ -587,12 +611,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = append(rf.log, &LogEntry{})
 	rf.votedFor = -1
 
-	file := "./" + "log" + ".txt"
-	logFile, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
-	if err != nil {
-		panic(err)
-	}
-	log.SetOutput(logFile) // 将文件设置为log输出的文件
+	//file := "./" + "log" + ".txt"
+	//logFile, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
+	//if err != nil {
+	//	panic(err)
+	//}
+	//log.SetOutput(logFile) // 将文件设置为log输出的文件
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -676,9 +700,10 @@ func (rf *Raft) sendHeartbeat() {
 	var replyCh chan int
 	var stopSignal *bool
 
-	logIndex = rf.nextIndex[rf.me]
+	// logIndex是已收到客户端但是还没进行发送的命令号（并发情况下logIndex!=rf.lastApplied+1，也logIndex!=rf.nextIndex[rf.me]-1）
+	logIndex = rf.processedIndex + 1
 	needWaitForReplies := false
-	// 本来nextIndex期待是比现有日志编号大一号的，如果nextIndex位置有log了，说明收到client的命令了
+	// 本来rf.processedIndex + 1期待是比现有log数组最大的日志编号大一号的，如果这个位置有log了，说明收到client的命令了
 	if logIndex <= len(rf.log)-1 {
 		needWaitForReplies = true
 		// 填写收集reply方法需要的参数
@@ -688,6 +713,9 @@ func (rf *Raft) sendHeartbeat() {
 		replyCh = rf.log[logIndex].ReplyCh
 		// stopSignal解决"多个sender一个receiver"同步关闭replyCh的问题
 		stopSignal = rf.log[logIndex].ReplyChStopSignal
+		// 这条命令已经被处理了，自增，这样processQueue能够拿到这条命令
+		rf.processedIndex++
+		log.Printf("组装带命令心跳包的收集内容 idx:%v len:%v replyCh:%v stopSignal:%v", logIndex, len(rf.log), replyCh, stopSignal)
 	} else {
 		needWaitForReplies = false
 	}
@@ -701,6 +729,8 @@ func (rf *Raft) sendHeartbeat() {
 	realInterval := pollCollectClientCmdInterval - time.Since(prevNow)
 	if realInterval > 0 {
 		time.Sleep(realInterval)
+	} else {
+		time.Sleep(minSleepInterval)
 	}
 }
 
@@ -712,6 +742,7 @@ CollectLogReply:
 		select {
 		case <-replyCh:
 			// 收集
+			log.Printf("rf:%v 收到回复replyCh idx:%v cmd:%v", rf.me, logIndex, command)
 			currReplies++
 			if currReplies*2+1 >= len(rf.peers) {
 				rf.mu.Lock()
@@ -739,15 +770,15 @@ CollectLogReply:
 			}
 		case <-minElectionTimeoutCh:
 			log.Printf("等待append回复超时，idx:%v 命令无效", logIndex)
-			rf.mu.Lock()
+			//rf.mu.Lock()
 			// 删除logIndex日志
-			rf.log = append(rf.log[:logIndex], rf.log[logIndex+1:]...)
+			// rf.log = append(rf.log[:logIndex], rf.log[logIndex+1:]...)
 			if replyChStopSignal != nil {
 				*replyChStopSignal = true
 				close(replyCh)
 			}
 			commitCh <- false
-			rf.mu.Unlock()
+			//rf.mu.Unlock()
 			break CollectLogReply
 		}
 	}
@@ -843,6 +874,7 @@ CollectVotes:
 		for i := 0; i < len(rf.peers); i++ {
 			// 更新nextIndex
 			rf.nextIndex[i] = rf.commitIndex + 1
+			rf.processedIndex = rf.commitIndex
 			if i == rf.me {
 				continue
 			}
@@ -850,7 +882,6 @@ CollectVotes:
 			rf.matchIndex[i] = 0
 			// 启动发送队列
 			go rf.processSendQueue(i)
-
 		}
 
 		rf.meIdentity = leader
@@ -885,24 +916,24 @@ func (rf *Raft) processSendQueue(server int) {
 		// 说明又有新命令到来了，不sleep直接continue
 		leaderNextIndex := rf.nextIndex[rf.me]
 		// 组装args参数
-		lastLogIndexFromClient := len(rf.log) - 1
-		prevLogIdx := lastLogIndexFromClient - 1
-		log.Printf("rf:%v leaderLastIdxFromClient:%v nextIdx[%v]:%v", rf.me, lastLogIndexFromClient, server, rf.nextIndex[server])
+		// 拿到"可以发送部分"的最大日志编号
+		lastProcessedLogIndex := rf.processedIndex
+		prevLogIdx := rf.matchIndex[server]
+		log.Printf("rf:%v lastProcessedLogIndex:%v nextIdx[%v]:%v", rf.me, lastProcessedLogIndex, server, rf.nextIndex[server])
 		var prevLogTerm int
-		if prevLogIdx < 0 {
-			prevLogIdx = 0
-		}
 		prevLogTerm = rf.log[prevLogIdx].LogTerm
 
 		var args AppendEntriesArgs
 		var reply AppendEntriesReply
 
-		if lastLogIndexFromClient >= rf.nextIndex[server] {
+		// 判断要发的entries数组最后一个元素（也就是已处理的最新的logIndex）
+		if lastProcessedLogIndex >= rf.nextIndex[server] {
 			startIdx := rf.nextIndex[server]
 			// 因为只有最后一个logIndex有可能还在等待reply，所以下面两个参数选择的是最后一个log
-			replyChOfLastLog := rf.log[lastLogIndexFromClient].ReplyCh
-			stopSignalOfLastLog := rf.log[lastLogIndexFromClient].ReplyChStopSignal
-			entries := rf.log[startIdx:]
+			replyChOfLastLog := rf.log[lastProcessedLogIndex].ReplyCh
+			stopSignalOfLastLog := rf.log[lastProcessedLogIndex].ReplyChStopSignal
+			log.Printf("server:%v的nextidx是%v，lastProcessedLogIndex:%v, replyCh:%v stopSignal:%v", server, rf.nextIndex[server], lastProcessedLogIndex, replyChOfLastLog, stopSignalOfLastLog)
+			entries := rf.log[startIdx : lastProcessedLogIndex+1]
 			args = AppendEntriesArgs{
 				LeaderId:          rf.me,
 				LeaderTerm:        rf.currTerm,
@@ -940,8 +971,8 @@ func (rf *Raft) processSendQueue(server int) {
 				// ok && reply.Success
 				// 一切正常，更新nextIndex和matchIndex
 				if len(args.Entries) != 0 {
-					rf.matchIndex[server] = lastLogIndexFromClient
-					rf.nextIndex[server] = lastLogIndexFromClient + 1
+					rf.matchIndex[server] = lastProcessedLogIndex
+					rf.nextIndex[server] = lastProcessedLogIndex + 1
 				}
 			} else {
 				// ok && !reply.Success
@@ -971,10 +1002,13 @@ func (rf *Raft) processSendQueue(server int) {
 		// 一轮请求/响应结束，判断是否需要睡眠以及睡眠的时间
 		if retryImmediately {
 			rf.mu.Unlock()
+			time.Sleep(minSleepInterval)
 			continue
 		}
 		if leaderNextIndex != rf.nextIndex[rf.me] && leaderNextIndex != 0 {
+			log.Printf("rf:%v 因为收到新命令，需要立即重试 原nextIndex:%v 现nextIndex:%v", rf.me, leaderNextIndex, rf.nextIndex[rf.me])
 			rf.mu.Unlock()
+			time.Sleep(minSleepInterval)
 			continue
 		}
 		rf.mu.Unlock()
@@ -982,6 +1016,8 @@ func (rf *Raft) processSendQueue(server int) {
 		realInterval := appendEntriesInterval - time.Since(prevNow)
 		if realInterval > 0 {
 			time.Sleep(realInterval)
+		} else {
+			time.Sleep(minSleepInterval)
 		}
 	}
 }

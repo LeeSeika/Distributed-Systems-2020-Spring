@@ -156,6 +156,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 // contents
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
+		fmt.Printf("server:%v idx:%v cmd:%v valid:%v\n", i, m.CommandIndex, m.Command, m.CommandValid)
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
