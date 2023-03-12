@@ -267,6 +267,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		log.Printf("日志不完整 rf:%v term:%v vote down to candidate:%v candidateTerm:%v", rf.me, rf.currTerm, args.CandidateId, args.Term)
 		reply.VoteGranted = false
 		reply.Term = rf.currTerm
+		// 收到的candidate日志完整性更加低，但是term>=自己，针对>的情况，自身需要更新任期才能赶上选举，让自己凭着更高的完整性当上leader
+		rf.currTerm = args.Term
 		return
 	}
 
@@ -339,9 +341,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//log.Fatalf("mutiple leaders exist")
 	}
 	// 判断前一条日志的任期是否符合
-	if args.PrevLogIndex > len(rf.log)+1 || args.PrevLogTerm != rf.log[args.PrevLogIndex].LogTerm {
+	followerLastReceivedIdx := rf.log[len(rf.log)-1].Index
+	if args.PrevLogIndex > followerLastReceivedIdx || args.PrevLogTerm != rf.log[args.PrevLogIndex].LogTerm {
 		// 仅仅是打log的一个判断
-		if args.PrevLogIndex <= len(rf.log)+1 {
+		if args.PrevLogIndex <= followerLastReceivedIdx {
 			log.Printf("rf:%v 日志错序 args.PrevLogIdx:%v args.PrevLogTerm:%v rf.log[%v].LogTerm:%v", rf.me, args.PrevLogIndex, args.PrevLogTerm, args.PrevLogIndex, rf.log[args.PrevLogIndex].LogTerm)
 		}
 		log.Printf("%v", len(rf.log))
@@ -685,6 +688,10 @@ func (rf *Raft) sendHeartbeat() {
 	//log.Printf("rf:%v 判断%v %v", rf.me, time.Since(rf.lastReceiveFollowerDate), time.Duration(electionTimeoutInterval)*time.Millisecond+minElectionTimeout)
 	if time.Since(rf.lastReceiveFollowerDate) > time.Duration(electionTimeoutInterval)*time.Millisecond+minElectionTimeout {
 		log.Printf("rf:%v 超越最长的选举timeout，不会再是leader了", rf.me)
+		// 清空未处理的任务，一起返回客户端失败
+		for idx := rf.processedIndex + 1; idx < len(rf.log); idx++ {
+			rf.log[idx].CommitCh <- false
+		}
 		rf.meIdentity = follower
 		rf.mu.Unlock()
 		return
@@ -918,7 +925,15 @@ func (rf *Raft) processSendQueue(server int) {
 		// 组装args参数
 		// 拿到"可以发送部分"的最大日志编号
 		lastProcessedLogIndex := rf.processedIndex
-		prevLogIdx := rf.matchIndex[server]
+		// "前一条日志"应该是rf.nextIndex[server] - 1，这样follower才可以判断日志是否错序
+		// 但是在刚刚开始的时候，一条客户端的命令都没有，rf.nextIndex和rf.matchIndex都是0
+		// 这时候rf.nextIndex[server] - 1就会取到负数-1，这种情况换成matchIndex的0
+		var prevLogIdx int
+		if rf.nextIndex[server] > rf.matchIndex[server] {
+			prevLogIdx = rf.nextIndex[server] - 1
+		} else {
+			prevLogIdx = rf.matchIndex[server]
+		}
 		log.Printf("rf:%v lastProcessedLogIndex:%v nextIdx[%v]:%v", rf.me, lastProcessedLogIndex, server, rf.nextIndex[server])
 		var prevLogTerm int
 		prevLogTerm = rf.log[prevLogIdx].LogTerm
