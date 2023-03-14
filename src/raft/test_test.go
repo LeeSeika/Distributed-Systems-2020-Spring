@@ -642,7 +642,10 @@ func TestPersist12C(t *testing.T) {
 	cfg.start1(leader2, cfg.applier)
 	cfg.connect(leader2)
 
+	log.Printf("W====A=====I=========T")
+
 	cfg.wait(4, servers, -1) // wait for leader2 to join before killing i3
+	log.Printf("after W====A=====I=========T")
 
 	i3 := (cfg.checkOneLeader() + 1) % servers
 	cfg.disconnect(i3)
@@ -835,6 +838,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
+		log.Printf("【来自Test】iters:%v", iters)
 		if iters == 200 {
 			cfg.setlongreordering(true)
 		}
@@ -843,6 +847,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			_, _, ok := cfg.rafts[i].Start(rand.Int() % 10000)
 			if ok && cfg.connected[i] {
 				leader = i
+				log.Printf("【来自Test】发现leader：%v", leader)
 			}
 		}
 
