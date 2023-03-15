@@ -163,6 +163,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.commitIndex)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -178,16 +179,19 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currTerm int
 	var votedFor int
+	var commitIndex int
 	logEntries := []*LogEntry{}
 	if d.Decode(&currTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&logEntries) != nil {
+		d.Decode(&logEntries) != nil ||
+		d.Decode(&commitIndex) != nil {
 		//   error...
 		log.Fatalf("error")
 	} else {
 		rf.currTerm = currTerm
 		rf.votedFor = votedFor
 		rf.log = logEntries
+		rf.commitIndex = commitIndex
 		log.Println("===========read persist===========")
 		log.Printf("rf:%v term:%v votedFor:%v", rf.me, rf.currTerm, rf.votedFor)
 		for i := 0; i < len(rf.log); i++ {
@@ -516,7 +520,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.mu.Lock()
 	index = rf.nextIndex[rf.me]
-	log.Printf("rf:%v 收到命令 cmd:%v idx:%v rfIdentity:%v %v", rf.me, command, index, rf.meIdentity, time.Now())
+	log.Printf("rf:%v 收到命令 cmd:%v idx:%v cmd:%v rfIdentity:%v %v", rf.me, command, index, command, rf.meIdentity, time.Now())
 	rf.nextIndex[rf.me]++
 	signal := false
 	logEntry := LogEntry{
@@ -580,7 +584,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 					rf.nextIndex[i] = index
 				}
 			}
+			// 考虑一种情况，客户端并发发送idx为27，28，29两条命令，idx=27的命令超时了，会走下面的逻辑，把idx=27的命令从log数组中删除掉
+			// 然后原idx=28（现27）也超时了，这时候这个方法内部的局部变量index=28，下面的逻辑删除的是先index=28（原29），这就会出问题了
+			// 所以我们删除前，要根据cmd判断是否需要更新index
+			for index >= len(rf.log) {
+				// 判断是否越界了
+				index--
+			}
+			for rf.log[index].Command != command {
+				index--
+			}
+
 			// 删除这条log，并且更新log数组元素的index
+			//log.Printf("rf:%v 删除前的rf.log", rf.me)
+			//for idx := index; idx < len(rf.log); idx++ {
+			//	log.Printf("rf:%v rf.log[%v].idx = %v rf.log[%v].cmd = %v replyCh = %v", rf.me, idx, rf.log[idx].Index, idx, rf.log[idx].Command, rf.log[idx].ReplyCh)
+			//}
 			rf.log = append(rf.log[:index], rf.log[index+1:]...)
 			for idx := index; idx < len(rf.log); idx++ {
 				log.Printf("rf:%v 超时后更新索引 log[%v].Index=%v 更新为Index=%v", rf.me, idx, rf.log[idx].Index, idx)
@@ -677,7 +696,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.nextIndex[rf.me] = rf.log[len(rf.log)-1].Index + 1
-	rf.commitIndex = rf.nextIndex[rf.me] - 1
+	// rf.commitIndex = rf.nextIndex[rf.me] - 1
 	rf.lastApplied = rf.commitIndex
 	// rf.processedIndex = rf.commitIndex
 	// 这里的改动跟rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1一样的理由（figure 8）
@@ -783,7 +802,7 @@ func (rf *Raft) sendHeartbeat() {
 		stopSignal = rf.log[logIndex].ReplyChStopSignal
 		// 这条命令已经被处理了，自增，这样processQueue能够拿到这条命令
 		rf.processedIndex++
-		log.Printf("组装带命令心跳包的收集内容 idx:%v len:%v replyCh:%v stopSignal:%v, %v", logIndex, len(rf.log), replyCh, stopSignal, time.Now())
+		log.Printf("组装带命令心跳包的收集内容 idx:%v cmd:%v len:%v replyCh:%v stopSignal:%v, %v", logIndex, command, len(rf.log), replyCh, stopSignal, time.Now())
 	} else {
 		needWaitForReplies = false
 	}
@@ -807,8 +826,10 @@ func (rf *Raft) collectAppendReply(commitCh chan bool, replyCh chan int, logInde
 	minElectionTimeoutCh := time.After(minElectionTimeout)
 	extendedTimeoutCh := time.After(maxWaitForAppendRPCReplyTimeout)
 	prevFollowerReplyDate := rf.lastReceiveFollowerDate
+	count := rand.Int31()
 CollectLogReply:
 	for {
+		log.Printf("for select idx:%v count:%v", logIndex, count)
 		select {
 		case <-replyCh:
 			// 收集
@@ -818,6 +839,7 @@ CollectLogReply:
 				rf.mu.Lock()
 				if replyChStopSignal != nil {
 					*replyChStopSignal = true
+					log.Printf("close 1 idx:%v", logIndex)
 					close(replyCh)
 				}
 				// commit这条LogEntry
@@ -854,6 +876,7 @@ CollectLogReply:
 			// rf.log = append(rf.log[:logIndex], rf.log[logIndex+1:]...)
 			if replyChStopSignal != nil {
 				*replyChStopSignal = true
+				log.Printf("close 2 idx:%v", logIndex)
 				close(replyCh)
 			}
 			commitCh <- false
