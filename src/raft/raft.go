@@ -1041,7 +1041,7 @@ func (rf *Raft) processSendQueue(server int) {
 		} else {
 			prevLogIdx = rf.matchIndex[server]
 		}
-		log.Printf("rf:%v lastProcessedLogIndex:%v nextIdx[%v]:%v", rf.me, lastProcessedLogIndex, server, rf.nextIndex[server])
+		log.Printf("rf:%v lastProcessedLogIndex:%v nextIdx[%v]:%v matchIdx:%v", rf.me, lastProcessedLogIndex, server, rf.nextIndex[server], rf.matchIndex[server])
 		var prevLogTerm int
 		prevLogTerm = rf.log[prevLogIdx].LogTerm
 
@@ -1129,6 +1129,9 @@ func (rf *Raft) processSendQueue(server int) {
 					// 如果follower不是因为任期落后而拒绝的，说明是日志错序
 					// nextIndex[server]-1并立即重试
 					rf.nextIndex[server]--
+					if rf.nextIndex[server] <= rf.matchIndex[server] {
+						rf.matchIndex[server]--
+					}
 					log.Printf("rf:%v server:%v 日志错序 ------ 新nextidx=%v", rf.me, server, rf.nextIndex[server])
 					retryImmediately = true
 				}
