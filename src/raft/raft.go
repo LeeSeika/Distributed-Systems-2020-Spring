@@ -403,6 +403,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		if entry.Index < len(rf.log) {
+		if entry.Index <= rf.log[len(rf.log)-1].Index {
 			// 如果存在，则直接覆盖，无论是否相同
 			rf.log[entry.Index] = entry
 		} else {
@@ -560,14 +561,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      command,
-				CommandIndex: index,
+				CommandIndex: logEntry.Index,
 			}
 			rf.applyCh <- applyMsg
-			rf.lastApplied = index
+			rf.lastApplied = logEntry.Index
 			rf.commitIndex = rf.lastApplied
 			// 把nextIndex变回大于leader现有日志大一号的状态
 			// rf.nextIndex[rf.me] = rf.lastApplied + 1
-			log.Printf("rf:%v leader apply idx:%v cmd:%v", rf.me, index, command)
+			log.Printf("rf:%v leader apply idx:%v cmd:%v", rf.me, logEntry.Index, command)
 
 		} else {
 			// 同时更新follower的matchIndex和nextIndex
