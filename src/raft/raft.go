@@ -125,6 +125,9 @@ type Raft struct {
 	lastReceivedAppendEntriesDate time.Time
 	lastReceiveFollowerDate       time.Time //用于leader判断自己是否脱离集群，失去leader地位了
 	processedIndex                int       // 记录已经经过sendHeartbeat方法处理的最大日志编号
+	logIndexOffset                int
+	lastIncludedIndex             int
+	lastIncludedTerm              int
 
 	//term                          int
 
@@ -194,9 +197,9 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = commitIndex
 		log.Println("===========read persist===========")
 		log.Printf("rf:%v term:%v votedFor:%v", rf.me, rf.currTerm, rf.votedFor)
-		for i := 0; i < len(rf.log); i++ {
-			log.Printf("rf:%v log[%v]=%v", rf.me, rf.log[i].Index, rf.log[i].Command)
-		}
+		//for i := 0; i < len(rf.log); i++ {
+		//	log.Printf("rf:%v log[%v]=%v", rf.me, rf.log[i].Index, rf.log[i].Command)
+		//}
 	}
 }
 
@@ -205,6 +208,36 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.commitIndex >= lastIncludedIndex || lastIncludedIndex-rf.logIndexOffset < 0 {
+		log.Printf("rf:%v 拒绝install snapshot lastIncluedIdx:%v rf.cmtIdx:%v rf.logOffset:%v", rf.me, lastIncludedIndex, rf.commitIndex, rf.logIndexOffset)
+		return false
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var command int
+	if d.Decode(&command) != nil {
+		log.Fatalf("rf:%v snapshot decode error lastIncluedIdx:%v ", rf.me, lastIncludedIndex)
+	}
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+
+	if rf.lastIncludedIndex > rf.log[len(rf.log)-1].Index {
+		// 整个rf.log数组都落后了
+		log.Printf("rf:%v condInstallSnapshot 整个rf.log都落后了，全部删除", rf.me)
+		rf.log = rf.log[:1]
+	} else {
+		// snapshot的lastIncludedIndex在rf.log的中间，删除一部分
+		log.Printf("rf:%v condInstallSnapshot 删除部分落后日志 lastIncludedIdx:%v rf.lastLogIdx:%v", rf.me, lastIncludedIndex, rf.log[len(rf.log)-1].Index)
+		rf.log = append(rf.log[:1], rf.log[rf.lastIncludedIndex+1-rf.logIndexOffset:]...)
+	}
+	rf.logIndexOffset = lastIncludedIndex
+	rf.lastApplied = rf.lastIncludedIndex
+	rf.commitIndex = rf.lastApplied
+	rf.log[0].Index = rf.lastIncludedIndex
+	rf.log[0].LogTerm = rf.lastIncludedTerm
 
 	return true
 }
@@ -215,7 +248,38 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//for idx := 0; idx < len(rf.log); idx++ {
+	//	log.Printf("snapshot前 rf:%v rf.log[%v] idx=%v cmd=%v", rf.me, idx, rf.log[idx].Index, rf.log[idx].Command)
+	//}
+	prevFirstLogIdx := rf.log[0].Index
+	rf.lastIncludedTerm = rf.getLog(index).LogTerm
+	rf.log = append(rf.log[:1], rf.log[index+1-rf.logIndexOffset:]...)
+	//if rf.log[0].Index == 0 {
+	rf.logIndexOffset = index
+	//}
+	rf.lastIncludedIndex = index
+	rf.lastApplied = rf.lastIncludedIndex
+	rf.commitIndex = rf.lastApplied
+	rf.log[0].Index = rf.lastIncludedIndex
+	rf.log[0].LogTerm = rf.lastIncludedTerm
 
+	//for idx := 0; idx < len(rf.log); idx++ {
+	//	log.Printf("snapshot后 rf:%v rf.log[%v] idx=%v cmd=%v", rf.me, idx, rf.log[idx].Index, rf.log[idx].Command)
+	//}
+	log.Printf("rf:%v snapshot index:%v prevFirstIdx:%v currLogLen:%v", rf.me, index, prevFirstLogIdx, len(rf.log))
+
+	// prepare state data
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.commitIndex)
+	data := w.Bytes()
+	// persist
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 // example RequestVote RPC arguments structure.
@@ -256,6 +320,18 @@ type AppendEntriesReply struct {
 	Term    int
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Snapshot          []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -294,8 +370,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// 论文figure 8 最后一条log还要判断term的大小
-	if meLastLogIndex == args.LastLogIndex && rf.log[meLastLogIndex].LogTerm > args.LastLogTerm {
-		log.Printf("最后一条日志的term不同 rf:%v term:%v vote down to candidate:%v candidateTerm:%v follower.lastLogTerm:%v candidate.lastLogTerm:%v", rf.me, rf.currTerm, args.CandidateId, args.Term, rf.log[rf.lastApplied].LogTerm, args.LastLogTerm)
+	if meLastLogIndex == args.LastLogIndex && rf.getLog(meLastLogIndex).LogTerm > args.LastLogTerm {
+		log.Printf("最后一条日志的term不同 rf:%v term:%v vote down to candidate:%v candidateTerm:%v follower.lastLogTerm:%v candidate.lastLogTerm:%v", rf.me, rf.currTerm, args.CandidateId, args.Term, rf.getLog(rf.lastApplied).LogTerm, args.LastLogTerm)
 		reply.VoteGranted = false
 		reply.Term = rf.currTerm
 		// 收到的candidate日志完整性更加低，但是term>=自己，针对>的情况，自身需要更新任期才能赶上选举，让自己凭着更高的完整性当上leader
@@ -374,10 +450,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 判断前一条日志的任期是否符合
 	followerLastReceivedIdx := rf.log[len(rf.log)-1].Index
-	if args.PrevLogIndex > followerLastReceivedIdx || args.PrevLogTerm != rf.log[args.PrevLogIndex].LogTerm {
+	if args.PrevLogIndex > followerLastReceivedIdx || args.PrevLogTerm != rf.getLog(args.PrevLogIndex).LogTerm {
 		// 仅仅是打log的一个判断
 		if args.PrevLogIndex <= followerLastReceivedIdx {
-			log.Printf("rf:%v follower前一条日志的任期不符合 args.prevLogTerm:%v rf.prevLogTerm:%v", rf.me, args.PrevLogTerm, rf.log[args.PrevLogIndex].LogTerm)
+			log.Printf("rf:%v follower前一条日志的任期不符合 args.prevLogTerm:%v rf.prevLogTerm:%v", rf.me, args.PrevLogTerm, rf.getLog(args.PrevLogIndex).LogTerm)
 		}
 		log.Printf("rf:%v 日志错序 args.PrevLogIdx:%v followerLastLogIdx:%v", rf.me, args.PrevLogIndex, followerLastReceivedIdx)
 		reply.Success = false
@@ -390,7 +466,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currTerm
 	rf.lastReceivedAppendEntriesDate = time.Now()
 	// 更新日志状态
-	log.Printf("rf:%v 未更新日志之前的最大logIdx:%v cmtIdx:%v lastAppiedIdx：%v", rf.me, len(rf.log)-1, rf.commitIndex, rf.lastApplied)
+	log.Printf("rf:%v 未更新日志之前的最大logIdx:%v cmtIdx:%v lastAppiedIdx：%v", rf.me, rf.log[len(rf.log)-1].Index, rf.commitIndex, rf.lastApplied)
 	newEntries := []*LogEntry{}
 	for i := 0; i < len(args.Entries); i++ {
 		entryFromLeader := args.Entries[i]
@@ -402,10 +478,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			Index:   entryFromLeader.Index,
 		}
 
-		if entry.Index < len(rf.log) {
 		if entry.Index <= rf.log[len(rf.log)-1].Index {
 			// 如果存在，则直接覆盖，无论是否相同
-			rf.log[entry.Index] = entry
+			rf.setLog(entry.Index, entry)
 		} else {
 			// 不存在则先添加到临时切片newEntries
 			newEntries = append(newEntries, entry)
@@ -419,8 +494,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		msg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[i].Command,
-			CommandIndex: rf.log[i].Index,
+			Command:      rf.getLog(i).Command,
+			CommandIndex: rf.getLog(i).Index,
 		}
 		rf.applyCh <- msg
 		log.Printf("rf:%v follower commit idx:%v", rf.me, msg.CommandIndex)
@@ -473,9 +548,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if len(args.Entries) == 0 {
 		log.Printf("normal hearbeat")
 	} else {
-		for i := 0; i < len(args.Entries); i++ {
-			log.Printf("entry idx:%v command:%v logTerm:%v", args.Entries[i].Index, args.Entries[i].Command, args.Entries[i].LogTerm)
-		}
+		//for i := 0; i < len(args.Entries); i++ {
+		//	log.Printf("entry idx:%v command:%v logTerm:%v", args.Entries[i].Index, args.Entries[i].Command, args.Entries[i].LogTerm)
+		//}
 	}
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -543,8 +618,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		if success {
 			// figure 8 可能需要间接提交前面任期的日志，检查一下
-			for prevLogIdx := rf.commitIndex + 1; prevLogIdx < len(rf.log)-1; prevLogIdx++ {
-				prevLog := rf.log[prevLogIdx]
+			for prevLogIdx := rf.commitIndex + 1; prevLogIdx < rf.log[len(rf.log)-1].Index; prevLogIdx++ {
+				prevLog := rf.getLog(prevLogIdx)
 				if prevLog.LogTerm == rf.currTerm {
 					break
 				}
@@ -588,11 +663,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			// 考虑一种情况，客户端并发发送idx为27，28，29两条命令，idx=27的命令超时了，会走下面的逻辑，把idx=27的命令从log数组中删除掉
 			// 然后原idx=28（现27）也超时了，这时候这个方法内部的局部变量index=28，下面的逻辑删除的是先index=28（原29），这就会出问题了
 			// 所以我们删除前，要根据cmd判断是否需要更新index
-			for index >= len(rf.log) {
+			for index >= len(rf.log)+rf.logIndexOffset {
 				// 判断是否越界了
 				index--
 			}
-			for rf.log[index].Command != command {
+			for rf.getLog(index).Command != command {
 				index--
 			}
 
@@ -601,10 +676,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			//for idx := index; idx < len(rf.log); idx++ {
 			//	log.Printf("rf:%v rf.log[%v].idx = %v rf.log[%v].cmd = %v replyCh = %v", rf.me, idx, rf.log[idx].Index, idx, rf.log[idx].Command, rf.log[idx].ReplyCh)
 			//}
-			rf.log = append(rf.log[:index], rf.log[index+1:]...)
-			for idx := index; idx < len(rf.log); idx++ {
-				log.Printf("rf:%v 超时后更新索引 log[%v].Index=%v 更新为Index=%v", rf.me, idx, rf.log[idx].Index, idx)
-				rf.log[idx].Index = idx
+			rf.log = append(rf.log[:index-rf.logIndexOffset], rf.log[index+1-rf.logIndexOffset:]...)
+			for idx := index; idx <= rf.log[len(rf.log)-1].Index; idx++ {
+				log.Printf("rf:%v 超时后更新索引 log[%v].Index=%v 更新为Index=%v", rf.me, idx-rf.logIndexOffset, rf.getLog(idx).Index, idx)
+				rf.getLog(idx).Index = idx
 			}
 			rf.nextIndex[rf.me]--
 			rf.processedIndex--
@@ -683,8 +758,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.lastApplied = 0
 	rf.commitIndex = 0
+	rf.logIndexOffset = 0
 	// 初始化，防止第一个任期vote的时候读到rf.log[0]=nil
-	rf.log = append(rf.log, &LogEntry{})
+	rf.log = append(rf.log, &LogEntry{Index: 0})
 	rf.votedFor = -1
 
 	//file := "./" + "log" + ".txt"
@@ -704,6 +780,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 我们要保证rf.processedIndex = rf.log[len(rf.log) - 1].Index，才能不覆盖旧leader发过来但还没有来得及提交的日志
 	// 自己（新leader）会在后面新到来的命令中间接地提交这些日志
 	rf.processedIndex = rf.log[len(rf.log)-1].Index
+	rf.logIndexOffset = rf.log[0].Index
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -771,7 +848,7 @@ func (rf *Raft) sendHeartbeat() {
 		log.Printf("rf:%v 超越最长的选举timeout，不会再是leader了", rf.me)
 		// 清空未处理的任务，一起返回客户端失败
 		for idx := rf.processedIndex + 1; idx < len(rf.log); idx++ {
-			rf.log[idx].CommitCh <- false
+			rf.getLog(idx).CommitCh <- false
 		}
 		rf.meIdentity = follower
 		rf.mu.Unlock()
@@ -792,15 +869,15 @@ func (rf *Raft) sendHeartbeat() {
 	logIndex = rf.processedIndex + 1
 	needWaitForReplies := false
 	// 本来rf.processedIndex + 1期待是比现有log数组最大的日志编号大一号的，如果这个位置有log了，说明收到client的命令了
-	if logIndex <= len(rf.log)-1 {
+	if logIndex <= rf.log[len(rf.log)-1].Index {
 		needWaitForReplies = true
 		// 填写收集reply方法需要的参数
-		command = rf.log[logIndex].Command
-		replyClientCh = rf.log[logIndex].CommitCh
+		command = rf.getLog(logIndex).Command
+		replyClientCh = rf.getLog(logIndex).CommitCh
 		// 本轮日志发送的reply收集channel
-		replyCh = rf.log[logIndex].ReplyCh
+		replyCh = rf.getLog(logIndex).ReplyCh
 		// stopSignal解决"多个sender一个receiver"同步关闭replyCh的问题
-		stopSignal = rf.log[logIndex].ReplyChStopSignal
+		stopSignal = rf.getLog(logIndex).ReplyChStopSignal
 		// 这条命令已经被处理了，自增，这样processQueue能够拿到这条命令
 		rf.processedIndex++
 		log.Printf("组装带命令心跳包的收集内容 idx:%v cmd:%v len:%v replyCh:%v stopSignal:%v, %v", logIndex, command, len(rf.log), replyCh, stopSignal, time.Now())
@@ -915,7 +992,7 @@ func (rf *Raft) startNewElection() {
 			Term:         electionTerm,
 			CandidateId:  rf.me,
 			LastLogIndex: meLastLogIndex,
-			LastLogTerm:  rf.log[meLastLogIndex].LogTerm,
+			LastLogTerm:  rf.getLog(meLastLogIndex).LogTerm,
 		}
 		reply := RequestVoteReply{}
 		// 投票RPC新开一个goroutine去处理，当那些goroutine接收到reply时，通知这个goroutine
@@ -1027,6 +1104,12 @@ func (rf *Raft) processSendQueue(server int) {
 			return
 		}
 		prevNow := time.Now()
+		// 检查是否需要发送installSnapshotRPC
+		if rf.nextIndex[server]-rf.logIndexOffset <= 0 {
+			rf.sendIntsallSnapshot(server)
+			time.Sleep(minSleepInterval)
+			continue
+		}
 		// 记录当前leader期待客户端发来的最新命令编号，如果一套请求响应流程走完后，这个编号更新了
 		// 说明又有新命令到来了，不sleep直接continue
 		leaderNextIndex := rf.nextIndex[rf.me]
@@ -1044,7 +1127,12 @@ func (rf *Raft) processSendQueue(server int) {
 		}
 		log.Printf("rf:%v lastProcessedLogIndex:%v nextIdx[%v]:%v matchIdx:%v", rf.me, lastProcessedLogIndex, server, rf.nextIndex[server], rf.matchIndex[server])
 		var prevLogTerm int
-		prevLogTerm = rf.log[prevLogIdx].LogTerm
+		// 如果nextIdx[server]刚好是log数组的第一个元素，那么prevLogIdx就会越界，要判断这种情况
+		if prevLogIdx-rf.logIndexOffset != -1 {
+			prevLogTerm = rf.getLog(prevLogIdx).LogTerm
+		} else {
+			prevLogTerm = rf.lastIncludedTerm
+		}
 
 		var args AppendEntriesArgs
 		var reply AppendEntriesReply
@@ -1053,10 +1141,10 @@ func (rf *Raft) processSendQueue(server int) {
 		if lastProcessedLogIndex >= rf.nextIndex[server] {
 			startIdx := rf.nextIndex[server]
 			// 因为只有最后一个logIndex有可能还在等待reply，所以下面两个参数选择的是最后一个log
-			replyChOfLastLog := rf.log[lastProcessedLogIndex].ReplyCh
-			stopSignalOfLastLog := rf.log[lastProcessedLogIndex].ReplyChStopSignal
+			replyChOfLastLog := rf.getLog(lastProcessedLogIndex).ReplyCh
+			stopSignalOfLastLog := rf.getLog(lastProcessedLogIndex).ReplyChStopSignal
 			log.Printf("server:%v的nextidx是%v，lastProcessedLogIndex:%v, replyCh:%v stopSignal:%v", server, rf.nextIndex[server], lastProcessedLogIndex, replyChOfLastLog, stopSignalOfLastLog)
-			entries := rf.log[startIdx : lastProcessedLogIndex+1]
+			entries := rf.log[startIdx-rf.logIndexOffset : lastProcessedLogIndex+1-rf.logIndexOffset]
 			args = AppendEntriesArgs{
 				LeaderId:          rf.me,
 				LeaderTerm:        rf.currTerm,
@@ -1104,13 +1192,13 @@ func (rf *Raft) processSendQueue(server int) {
 					} else {
 						// start还没有删除这条index位置的log，也不能判定超时情况，因为有可能客户端新的命令占用了这个index
 						// 我们还要检查原来的cmd和现在的cmd是否一致
-						recheckLastLogCmd := rf.log[lastProcessedLogIndex].Command
+						recheckLastLogCmd := rf.getLog(lastProcessedLogIndex).Command
 						if recheckLastLogCmd == argsLastCmd {
 							rf.matchIndex[server] = lastProcessedLogIndex
 							rf.nextIndex[server] = lastProcessedLogIndex + 1
 							log.Printf("rf:%v server:%v 更新nextIndex和matchIndex", rf.me, server)
 						} else {
-							log.Printf("rf:%v 这条命令已经等待appendRPC超时，原来rf.log[%v]=%v 现在rf.log[%v]=%v", rf.me, lastProcessedLogIndex, argsLastCmd, lastProcessedLogIndex, recheckLastLogCmd)
+							log.Printf("rf:%v 这条命令已经等待appendRPC超时，原来rf.log[%v]=%v 现在rf.log[%v]=%v", rf.me, lastProcessedLogIndex-rf.logIndexOffset, argsLastCmd, lastProcessedLogIndex-rf.logIndexOffset, recheckLastLogCmd)
 						}
 					}
 				}
@@ -1164,4 +1252,76 @@ func (rf *Raft) processSendQueue(server int) {
 			time.Sleep(minSleepInterval)
 		}
 	}
+}
+
+func (rf *Raft) sendIntsallSnapshot(server int) {
+	snapshotBytes := rf.persister.ReadSnapshot()
+	if snapshotBytes == nil || len(snapshotBytes) == 0 {
+		log.Fatalf("rf:%v no snapshot found", rf.me)
+	}
+	args := &InstallSnapshotArgs{
+		Term:              rf.currTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+		Snapshot:          snapshotBytes,
+	}
+	reply := &InstallSnapshotReply{}
+	rf.mu.Unlock()
+
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+
+	rf.mu.Lock()
+	if ok {
+		if rf.currTerm >= reply.Term {
+			log.Printf("rf:%v server:%v 成功接收了snapshot，nextIdx[%v]=%v matchIdx[%v]=%v", rf.me, server, server, rf.lastIncludedIndex+1, server, rf.lastIncludedIndex)
+			rf.nextIndex[server] = rf.lastIncludedIndex + 1
+			rf.matchIndex[server] = rf.lastIncludedIndex
+		} else {
+			log.Printf("rf:%v server:%v 因为任期落后拒绝了snapshot reply.Term:%v rf.currTerm:%v", rf.me, server, reply.Term, rf.currTerm)
+			rf.currTerm = reply.Term
+		}
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.currTerm
+	if rf.currTerm > args.Term {
+		log.Printf("rf:%v snapshot任期落后 rf.currTerm:%v args.Term:%v", rf.me, rf.currTerm, args.Term)
+		return
+	}
+	if rf.lastIncludedIndex >= args.LastIncludedIndex {
+		log.Printf("rf:%v 已经有快照 rf.lastIncludedIdx:%v args.lastIncludedIdx:%v", rf.me, rf.lastIncludedIndex, args.LastIncludedIndex)
+		return
+	}
+	if rf.log[0].Index >= args.LastIncludedIndex {
+		log.Printf("rf:%v 快照内容已经落后 args.lastIncludedIdx:%v rf.log[0].Idx=%v", rf.me, args.LastIncludedIndex, rf.log[0].Index)
+		return
+	}
+	log.Printf("rf:%v 接受快照applyMsg", rf.me)
+	msg := ApplyMsg{
+		CommandValid:  false,
+		Command:       nil,
+		CommandIndex:  0,
+		SnapshotValid: true,
+		Snapshot:      args.Snapshot,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+	rf.applyCh <- msg
+}
+
+// 需要外层带锁
+// todo 下面两个方法，可能会有越界的情况，这里的越界指的是index可能小于0
+func (rf *Raft) getLog(index int) *LogEntry {
+	log.Printf("rf:%v index:%v getlog offset:%v", rf.me, index, rf.logIndexOffset)
+	return rf.log[index-rf.logIndexOffset]
+}
+
+func (rf *Raft) setLog(index int, entry *LogEntry) {
+	log.Printf("rf:%v index:%v setlog offset:%v", rf.me, index, rf.logIndexOffset)
+	rf.log[index-rf.logIndexOffset] = entry
 }
